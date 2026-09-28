@@ -205,7 +205,7 @@ class LicenseManager {
     func computeState() -> LicenseState {
         #if LOCAL_PRO_BUILD
         return .pro
-        #endif
+        #else
         #if DEBUG
         if hasMockedLicense { return state }
         #endif
@@ -222,6 +222,7 @@ class LicenseManager {
             return .pro
         }
         return computeTrialState()
+        #endif
     }
 
     private func computeTrialState() -> LicenseState {
