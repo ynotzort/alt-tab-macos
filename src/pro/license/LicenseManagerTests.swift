@@ -10,8 +10,8 @@ final class LicenseManagerTests: XCTestCase {
 
     override func setUp() {
         super.setUp()
-        suiteName = "test-license-\(UUID().uuidString)"
-        defaults = UserDefaults(suiteName: suiteName)!
+        suiteName = "com.lwouis.alt-tab-macos.tests.license"
+        defaults = TestDefaults.make(suiteName)
         clock = MockClock(now: Date(timeIntervalSince1970: 1_700_000_000))
         keychain = MockKeychain()
         api = MockLicenseAPI()
@@ -19,7 +19,7 @@ final class LicenseManagerTests: XCTestCase {
     }
 
     override func tearDown() {
-        UserDefaults().removePersistentDomain(forName: suiteName)
+        TestDefaults.tearDown(defaults, suiteName)
         super.tearDown()
     }
 
@@ -222,6 +222,22 @@ final class LicenseManagerTests: XCTestCase {
         guard case .trial = manager.state else { return XCTFail("expected trial, got \(manager.state)") }
         XCTAssertNil(keychain.value(account: LicenseManager.keychainKeyAccount))
         XCTAssertNil(keychain.value(account: LicenseManager.keychainInstanceAccount))
+    }
+
+    func testActivateFailureKeepsAnAlreadyStoredLicense() {
+        setupActivatedLicense(variantId: "pro")
+        manager.initialize()
+        api.activateResult = .success(ActivateResult(instanceId: "inst-2", variantId: "pro", customerEmail: nil))
+        // Re-activating with a different key on a machine whose keychain stopped accepting writes.
+        keychain.setValueStatus = { _ in errSecAuthFailed }
+        let exp = expectation(description: "activate")
+        manager.activate("LICENSE-KEY-XYZ") { _ in exp.fulfill() }
+        wait(for: [exp], timeout: 1)
+        // The rollback must not delete what the failed write left untouched.
+        XCTAssertEqual(keychain.value(account: LicenseManager.keychainKeyAccount), "LICENSE-ABC")
+        XCTAssertEqual(keychain.value(account: LicenseManager.keychainInstanceAccount), "instance-1")
+        XCTAssertEqual(keychain.value(account: LicenseManager.keychainVariantAccount), "pro")
+        XCTAssertEqual(manager.state, .pro)
     }
 
     func testDeactivateInstanceCallsApiWithoutTouchingLocalState() {
@@ -436,9 +452,6 @@ final class LicenseManagerTests: XCTestCase {
     }
 
     #if DEBUG
-    // mockProUser() is wrapped in #if DEBUG (it's a QAMenu helper only meant for dev/test builds).
-    // CI runs `xcodebuild test -configuration Release` which strips DEBUG out, so the call site
-    // must be guarded with the matching condition to keep the Release-config test build compiling.
     func testOnBeforeProUnlockFiresOnMockProUser() {
         manager.initialize()
         var hookFired = false
@@ -446,6 +459,37 @@ final class LicenseManagerTests: XCTestCase {
         manager.mockProUser()
         XCTAssertTrue(hookFired)
         XCTAssertEqual(manager.state, .pro)
+    }
+
+    func testMockProUserDoesNotAlterPersistedLicense() {
+        setupActivatedLicense(variantId: "pro_lifetime")
+        defaults.set("real@example.com", forKey: LicenseManager.customerEmailKey)
+        let storedDefaults = defaults.dictionaryRepresentation()
+        manager.mockProUser()
+        manager.refreshState()
+        XCTAssertEqual(manager.state, .pro)
+        XCTAssertEqual(manager.customerEmail, "john@cool-software.com")
+        XCTAssertFalse(manager.isLifetimeVariant)
+        XCTAssertEqual(keychain.value(account: LicenseManager.keychainKeyAccount), "LICENSE-ABC")
+        XCTAssertEqual(keychain.value(account: LicenseManager.keychainInstanceAccount), "instance-1")
+        XCTAssertEqual(keychain.value(account: LicenseManager.keychainVariantAccount), "pro_lifetime")
+        XCTAssertEqual(defaults.dictionaryRepresentation() as NSDictionary, storedDefaults as NSDictionary)
+    }
+
+    func testMockTrialDayDoesNotAlterPersistedLicense() {
+        setupActivatedLicense(variantId: "pro_lifetime")
+        defaults.set("real@example.com", forKey: LicenseManager.customerEmailKey)
+        let storedDefaults = defaults.dictionaryRepresentation()
+        manager.mockTrialDay(4)
+        manager.refreshState()
+        XCTAssertEqual(manager.state, .trial(daysRemaining: 11))
+        XCTAssertEqual(manager.daysSinceTrialStart, 3)
+        XCTAssertNil(manager.customerEmail)
+        XCTAssertFalse(manager.isLifetimeVariant)
+        XCTAssertEqual(keychain.value(account: LicenseManager.keychainKeyAccount), "LICENSE-ABC")
+        XCTAssertEqual(keychain.value(account: LicenseManager.keychainInstanceAccount), "instance-1")
+        XCTAssertEqual(keychain.value(account: LicenseManager.keychainVariantAccount), "pro_lifetime")
+        XCTAssertEqual(defaults.dictionaryRepresentation() as NSDictionary, storedDefaults as NSDictionary)
     }
     #endif
 
@@ -464,9 +508,13 @@ final class LicenseManagerTests: XCTestCase {
         defaults.set(true, forKey: "lastValidationResult")
     }
 
-    /// Runs the main run loop briefly so queued `DispatchQueue.main.async` blocks execute.
+    /// Run everything already queued on main, then return. The chain under test is two hops deep (the mock
+    /// API enqueues its completion, which enqueues the state write), so a block enqueued now runs after both.
+    /// A fixed `RunLoop.run(until:)` spin cost 50ms per call for the same guarantee.
     private func drainMainQueue() {
-        RunLoop.main.run(until: Date().addingTimeInterval(0.05))
+        let drained = expectation(description: "main queue drained")
+        DispatchQueue.main.async { drained.fulfill() }
+        wait(for: [drained], timeout: 1)
     }
 }
 
@@ -528,4 +576,3 @@ final class MockLicenseAPI: LicenseAPI {
         DispatchQueue.main.async { completion(r) }
     }
 }
-

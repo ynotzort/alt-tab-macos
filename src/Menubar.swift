@@ -51,7 +51,7 @@ class Menubar {
         menu.addItem(NSMenuItem.separator())
         addMenuItem(String(format: NSLocalizedString("Quit %@", comment: "%@ is AltTab"), App.name), #selector(NSApplication.terminate(_:)), "q", nil) // "xmark.rectangle" is not necessary; macos automatically recognizes Quit
         statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.squareLength)
-        statusItem.target = self
+        statusItem.button!.target = self
         statusItem.button!.action = #selector(statusItemOnClick)
         statusItem.button!.sendAction(on: [.leftMouseDown, .rightMouseDown])
         // Apply icon prefs eagerly here, while the status item is still being added to the
@@ -148,8 +148,21 @@ class Menubar {
         if let type = NSApp.currentEvent?.type, type != .leftMouseDown {
             App.showUiFromShortcut0()
         } else {
-            statusItem.popUpMenu(Menubar.menu)
+            popUpMenu()
         }
+    }
+
+    /// Replaces `NSStatusItem.popUpStatusItemMenu`, deprecated in 10.14. Neither documented
+    /// alternative works on its own: leaving `statusItem.menu` assigned makes macOS open the menu on
+    /// every click, swallowing the right-click that must show the switcher, and `NSMenu.popUp` puts
+    /// the menu at the wrong place on a status item (it lands over the menubar, offset sideways).
+    /// Assigning the menu only for the duration of a synthesized click keeps the branch above while
+    /// letting AppKit position the menu and highlight the icon. Clearing `menu` on the next line is
+    /// safe because `performClick` doesn't return until menu tracking ends.
+    static func popUpMenu() {
+        statusItem.menu = menu
+        statusItem.button!.performClick(nil)
+        statusItem.menu = nil
     }
 
     static func menubarIconCallback(_: NSControl?) {
@@ -186,10 +199,21 @@ class Menubar {
 
     private static var badgeDotLayer: CALayer?
 
+    /// `NSStatusBar.system.thickness`: the status item working area, 22pt on every macOS so far
+    /// (the visible menubar is taller since Tahoe, but items stay in a centred 22pt band).
+    /// The artwork is authored at 44pt. Handed over at that size it makes the button 44pt tall,
+    /// and macOS then draws the selection as a tall block overflowing the strip instead of the pill
+    /// every other menubar app gets. Any size <= 22 avoids that and renders identically, because
+    /// `.scaleProportionallyUpOrDown` below refits the image into the 22pt button either way. 22 is
+    /// the one that stays correct if that scaling mode ever changes: 44pt artwork at 22pt is an
+    /// exact 2:1 downscale, so one artboard unit is one device pixel on a retina display.
+    private static let iconSize = CGFloat(22)
+
     static private func loadPreferredIcon() {
         let i = Preferences.menubarIcon.indexAsString
         let image = NSImage(named: "menubar-\(i)")!
         image.isTemplate = i != "2"
+        image.size = NSSize(width: iconSize, height: iconSize)
         statusItem.button!.image = image
         statusItem.isVisible = true
         statusItem.button!.imageScaling = .scaleProportionallyUpOrDown
@@ -245,7 +269,6 @@ class UpgradeMenuItemView: NSView {
     private let backdrop = NSView()
     private var highlightObservation: NSKeyValueObservation?
     private let gradientLayer = ProGradient.makeLayer()
-    private var isShining = false
 
     override init(frame: NSRect) {
         super.init(frame: frame)
@@ -269,7 +292,7 @@ class UpgradeMenuItemView: NSView {
         let icon = NSImageView()
         icon.translatesAutoresizingMaskIntoConstraints = false
         icon.image = NSImage.fromSymbol(.starFill, pointSize: 11)
-        if #available(macOS 10.14, *) { icon.contentTintColor = .white }
+        icon.contentTintColor = .white
         icon.setContentHuggingPriority(.required, for: .horizontal)
         icon.setContentCompressionResistancePriority(.required, for: .horizontal)
         addSubview(icon)
@@ -298,12 +321,14 @@ class UpgradeMenuItemView: NSView {
         fatalError("Class only supports programmatic initialization")
     }
 
+    override var intrinsicContentSize: NSSize {
+        let labelSize = label.intrinsicContentSize
+        return NSSize(width: NSView.noIntrinsicMetric, height: ceil(labelSize.height) + 6)
+    }
+
     override func layout() {
         super.layout()
-        CATransaction.begin()
-        CATransaction.setDisableActions(true)
-        gradientLayer.frame = backdrop.bounds
-        CATransaction.commit()
+        caTransaction { gradientLayer.frame = backdrop.bounds }
     }
 
     override func viewDidMoveToWindow() {
@@ -326,32 +351,7 @@ class UpgradeMenuItemView: NSView {
     }
 
     private func playShineAnimation() {
-        guard !isShining else { return }
-        let pillBounds = gradientLayer.bounds
-        let shine = CAGradientLayer()
-        shine.colors = [
-            NSColor.white.withAlphaComponent(0).cgColor,
-            NSColor.white.withAlphaComponent(0.3).cgColor,
-            NSColor.white.withAlphaComponent(0).cgColor,
-        ]
-        shine.locations = [0, 0.5, 1]
-        shine.startPoint = CGPoint(x: 0, y: 0.5)
-        shine.endPoint = CGPoint(x: 1, y: 0.5)
-        shine.frame = CGRect(x: -pillBounds.width, y: 0, width: pillBounds.width, height: pillBounds.height)
-        gradientLayer.addSublayer(shine)
-        isShining = true
-        let animation = CABasicAnimation(keyPath: "position.x")
-        animation.fromValue = -pillBounds.width / 2
-        animation.toValue = pillBounds.width + pillBounds.width / 2
-        animation.duration = 0.6
-        animation.timingFunction = CAMediaTimingFunction(name: .easeInEaseOut)
-        CATransaction.begin()
-        CATransaction.setCompletionBlock { [weak self] in
-            shine.removeFromSuperlayer()
-            self?.isShining = false
-        }
-        shine.add(animation, forKey: "shine")
-        CATransaction.commit()
+        ProGradient.playShine(over: gradientLayer)
     }
 
     func updateContent(_ state: LicenseState) {
@@ -379,6 +379,9 @@ class UpgradeMenuItemView: NSView {
         result.append(NSAttributedString(string: "\n", attributes: mainAttrs))
         result.append(NSAttributedString(string: NSLocalizedString("Get Pro", comment: "Menubar option"), attributes: mainAttrs))
         label.attributedStringValue = result
+        invalidateIntrinsicContentSize()
+        let height = intrinsicContentSize.height
+        if frame.height != height { frame.size.height = height }
     }
 
     override func mouseUp(with event: NSEvent) {

@@ -52,14 +52,37 @@ class LicenseManager {
         didSet { onStateChanged?(state) }
     }
 
-    var customerEmail: String? { defaults.string(forKey: Self.customerEmailKey) }
+    #if DEBUG
+    private var hasMockedLicense = false
+    private var mockedTrialStartDate: Date?
+    private var mockedCustomerEmail: String?
+    private var mockedVariant: String?
+    #endif
+
+    var customerEmail: String? {
+        #if DEBUG
+        if hasMockedLicense { return mockedCustomerEmail }
+        #endif
+        return defaults.string(forKey: Self.customerEmailKey)
+    }
 
     var isLifetimeVariant: Bool {
+        #if DEBUG
+        if hasMockedLicense { return mockedVariant.map(Self.lifetimeVariants.contains) ?? false }
+        #endif
         guard let variant = keychain.value(account: Self.keychainVariantAccount) else { return false }
         return Self.lifetimeVariants.contains(variant)
     }
 
     var isProAvailable: Bool { state.isProAvailable }
+
+    var isMocked: Bool {
+        #if DEBUG
+        return hasMockedLicense
+        #else
+        return false
+        #endif
+    }
 
     /// Pro features are locked out as soon as the license is no longer valid. Degradable Pro
     /// preferences are downgraded to their Free equivalents immediately via
@@ -72,6 +95,9 @@ class LicenseManager {
     }
 
     var trialStartDate: Date? {
+        #if DEBUG
+        if hasMockedLicense { return mockedTrialStartDate }
+        #endif
         guard defaults.object(forKey: "trialStartDate") != nil else { return nil }
         return Date(timeIntervalSince1970: defaults.double(forKey: "trialStartDate"))
     }
@@ -114,15 +140,18 @@ class LicenseManager {
                     if let variantId = response.variantId {
                         writes.append((Self.keychainVariantAccount, variantId))
                     }
-                    var attempted: [String] = []
+                    var written: [String] = []
                     for (account, value) in writes {
                         let status = self.keychain.setValue(value, account: account)
-                        attempted.append(account)
                         if status != errSecSuccess {
-                            attempted.forEach { self.keychain.remove(account: $0) }
+                            // Only roll back what this activation actually wrote. A failed write left the
+                            // previous value in place, so removing that account would delete a license we
+                            // never wrote, which is the exact loss `setValue` avoids by not deleting.
+                            written.forEach { self.keychain.remove(account: $0) }
                             completion(.failure(LicenseAPIError.keychainWriteFailed(account: account, status: status)))
                             return
                         }
+                        written.append(account)
                     }
                     self.defaults.set(self.clock.now.timeIntervalSince1970, forKey: "lastValidation")
                     self.defaults.set(true, forKey: "lastValidationResult")
@@ -176,7 +205,10 @@ class LicenseManager {
     func computeState() -> LicenseState {
         #if LOCAL_PRO_BUILD
         return .pro
-        #else
+        #endif
+        #if DEBUG
+        if hasMockedLicense { return state }
+        #endif
         if keychain.value(account: Self.keychainKeyAccount) != nil {
             let lastValidationResult = defaults.bool(forKey: "lastValidationResult")
             guard lastValidationResult else { return .trialExpired }
@@ -190,7 +222,6 @@ class LicenseManager {
             return .pro
         }
         return computeTrialState()
-        #endif
     }
 
     private func computeTrialState() -> LicenseState {
@@ -236,47 +267,21 @@ class LicenseManager {
     }
 
     #if DEBUG
-    func mockTrialUser() {
-        keychain.remove(account: Self.keychainKeyAccount)
-        keychain.remove(account: Self.keychainInstanceAccount)
-        keychain.remove(account: Self.keychainVariantAccount)
-        defaults.set(clock.now.timeIntervalSince1970, forKey: "trialStartDate")
-        defaults.removeObject(forKey: "lastValidation")
-        defaults.removeObject(forKey: "lastValidationResult")
-        defaults.removeObject(forKey: Self.customerEmailKey)
-        state = .trial(daysRemaining: Self.trialDuration)
-    }
-
-    func mockTrialExpired() {
-        keychain.remove(account: Self.keychainKeyAccount)
-        keychain.remove(account: Self.keychainInstanceAccount)
-        keychain.remove(account: Self.keychainVariantAccount)
-        defaults.removeObject(forKey: "trialStartDate")
-        defaults.removeObject(forKey: "lastValidation")
-        defaults.removeObject(forKey: "lastValidationResult")
-        defaults.removeObject(forKey: Self.customerEmailKey)
-        state = .trialExpired
-    }
-
+    /// `day` is 1-based: day 1 is the day the trial started.
     func mockTrialDay(_ day: Int) {
-        keychain.remove(account: Self.keychainKeyAccount)
-        keychain.remove(account: Self.keychainInstanceAccount)
-        keychain.remove(account: Self.keychainVariantAccount)
-        let trialStart = clock.now.addingTimeInterval(-Double(day - 1) * 86400)
-        defaults.set(trialStart.timeIntervalSince1970, forKey: "trialStartDate")
-        defaults.removeObject(forKey: "lastValidation")
-        defaults.removeObject(forKey: "lastValidationResult")
-        defaults.removeObject(forKey: Self.customerEmailKey)
+        hasMockedLicense = true
+        mockedTrialStartDate = clock.now.addingTimeInterval(-Double(day - 1) * 86400)
+        mockedCustomerEmail = nil
+        mockedVariant = nil
         let daysRemaining = Self.trialDuration - (day - 1)
         state = daysRemaining > 0 ? .trial(daysRemaining: daysRemaining) : .trialExpired
     }
 
     func mockProUser() {
-        keychain.setValue("MOCK-PRO-LICENSE-KEY", account: Self.keychainKeyAccount)
-        keychain.setValue("mock-instance-id", account: Self.keychainInstanceAccount)
-        defaults.set(clock.now.timeIntervalSince1970, forKey: "lastValidation")
-        defaults.set(true, forKey: "lastValidationResult")
-        defaults.set("john@cool-software.com", forKey: Self.customerEmailKey)
+        hasMockedLicense = true
+        mockedTrialStartDate = nil
+        mockedCustomerEmail = "john@cool-software.com"
+        mockedVariant = "pro"
         onBeforeProUnlock()
         state = .pro
     }

@@ -14,8 +14,6 @@ typealias CGSSpaceID = UInt64
 struct CGSWindowCaptureOptions: OptionSet {
     let rawValue: UInt32
     static let ignoreGlobalClipShape = CGSWindowCaptureOptions(rawValue: 1 << 11)
-    // on a retina display, 1px is spread on 4px, so nominalResolution is 1/4 of bestResolution
-    static let nominalResolution = CGSWindowCaptureOptions(rawValue: 1 << 9)
     static let bestResolution = CGSWindowCaptureOptions(rawValue: 1 << 8)
     // when Stage Manager is enabled, screenshots can become skewed. This param gets us full-size screenshots regardless
     static let fullSize = CGSWindowCaptureOptions(rawValue: 1 << 19)
@@ -36,83 +34,27 @@ func CGSMainConnectionID() -> CGSConnectionID
 @_silgen_name("CGSHWCaptureWindowList")
 func CGSHWCaptureWindowList(_ cid: CGSConnectionID, _ windowList: UnsafeMutablePointer<CGWindowID>, _ windowCount: UInt32, _ options: CGSWindowCaptureOptions) -> Unmanaged<CFArray>
 
-/// returns an array of displays (as NSDictionary) -> each having an array of spaces (as NSDictionary) at the "Spaces" key; each having a space ID (as UInt64) at the "id64" key
+/// returns an array of displays (as NSDictionary), each with its Spaces (as NSDictionary) under the "Spaces"
+/// key, each Space carrying its id (as UInt64) under "id64".
+/// /!\ only returns correct values when the user has checked System Settings > Desktop & Dock >
+/// Mission Control > "Displays have separate Spaces". Unchecked, every display collapses into one entry whose
+/// "Display Identifier" is the literal string "Main", so per-screen topology is unavailable.
 /// * macOS 10.10+
-/// /!\ only returns correct values if the user has checked the checkbox in Preferences > Mission Control > "Displays have separate Spaces"
-/// See this example with 2 screens (1 laptop internal + 1 external):
-/// * Output with "Displays have separate Spaces" checked:
-///   [{
-///       "Current Space" =     {
-///           ManagedSpaceID = 4;
-///           id64 = 4;
-///           type = 0;
-///           uuid = "6622AC87-2FD2-48E8-934D-F6EB303AC9BA";
-///       };
-///       "Display Identifier" = "6FBB92D9-84CE-8D20-C114-3B1052DD9529";
-///       Spaces =     (
-///           {
-///               ManagedSpaceID = 4;
-///               id64 = 4;
-///               type = 0;
-///               uuid = "6622AC87-2FD2-48E8-934D-F6EB303AC9BA";
-///           }
-///       );
-///   }, {
-///       "Current Space" =     {
-///           ManagedSpaceID = 5;
-///           id64 = 5;
-///           type = 0;
-///           uuid = "BE05AFA2-B253-4199-B39E-A8E77CD4851B";
-///       };
-///       "Display Identifier" = "BB2327F9-3D4F-FD8F-A0EA-B9745A0B818F";
-///       Spaces =     (
-///           {
-///               ManagedSpaceID = 5;
-///               id64 = 5;
-///               type = 0;
-///               uuid = "BE05AFA2-B253-4199-B39E-A8E77CD4851B";
-///           }
-///       );
-///   }]
-/// * Output with "Displays have separate Spaces" unchecked:
-///   [{
-///       "Current Space" =     {
-///           ManagedSpaceID = 4;
-///           id64 = 4;
-///           type = 0;
-///           uuid = "6622AC87-2FD2-48E8-934D-F6EB303AC9BA";
-///       };
-///       "Display Identifier" = Main;
-///       Spaces =     (
-///           {
-///               ManagedSpaceID = 4;
-///               id64 = 4;
-///               type = 0;
-///               uuid = "6622AC87-2FD2-48E8-934D-F6EB303AC9BA";
-///           }
-///       );
-///   }]
 @_silgen_name("CGSCopyManagedDisplaySpaces")
 func CGSCopyManagedDisplaySpaces(_ cid: CGSConnectionID) -> CFArray
 
+/// Only the bits we pass. The rest of the map was surveyed and is not production code.
 struct CGSCopyWindowsOptions: OptionSet {
     let rawValue: Int
     static let invisible1 = CGSCopyWindowsOptions(rawValue: 1 << 0)
     // retrieves windows when their app is assigned to All Spaces, and windows at ScreenSaver level 1000
     static let screenSaverLevel1000 = CGSCopyWindowsOptions(rawValue: 1 << 1)
     static let invisible2 = CGSCopyWindowsOptions(rawValue: 1 << 2)
-    static let unknown1 = CGSCopyWindowsOptions(rawValue: 1 << 3)
-    static let unknown2 = CGSCopyWindowsOptions(rawValue: 1 << 4)
-    static let desktopIconWindowLevel2147483603 = CGSCopyWindowsOptions(rawValue: 1 << 5)
 }
 
+/// We pass an empty set for both the set- and clear-tags arguments, so none of the tag bits are named here.
 struct CGSCopyWindowsTags: OptionSet {
     let rawValue: Int
-    static let level0 = CGSCopyWindowsTags(rawValue: 1 << 0)
-    static let noTitleMaybePopups = CGSCopyWindowsTags(rawValue: 1 << 1)
-    static let unknown1 = CGSCopyWindowsTags(rawValue: 1 << 2)
-    static let mainMenuWindowAndDesktopIconWindow = CGSCopyWindowsTags(rawValue: 1 << 3)
-    static let unknown2 = CGSCopyWindowsTags(rawValue: 1 << 4)
 }
 
 /// returns an array of window IDs (as UInt32) for the space(s) provided as `spaces`
@@ -140,18 +82,12 @@ enum CGSSpaceMask: Int {
 /// get the CGSSpaceIDs for the given windows (CGWindowIDs)
 /// * macOS 10.10+
 @_silgen_name("CGSCopySpacesForWindows")
-func CGSCopySpacesForWindows(_ cid: CGSConnectionID, _ mask: CGSSpaceMask.RawValue, _ wids: CFArray) -> CFArray
+func CGSCopySpacesForWindows(_ cid: CGSConnectionID, _ mask: CGSSpaceMask.RawValue, _ wids: CFArray) -> CFArray?
 
 /// returns window level (see definition in CGWindowLevel.h) of provided window
 /// * macOS 10.10+
 @_silgen_name("CGSGetWindowLevel") @discardableResult
 func CGSGetWindowLevel(_ cid: CGSConnectionID, _ wid: CGWindowID, _ level: UnsafeMutablePointer<CGWindowLevel>) -> CGError
-
-/// returns status of the checkbox in System Preferences > Security & Privacy > Privacy > Screen Recording
-/// returns 1 if checked or 0 if unchecked; also prompts the user the first time if unchecked
-/// the return value will be the same during the app lifetime; it will not reflect the actual status of the checkbox
-@_silgen_name("SLSRequestScreenCaptureAccess") @discardableResult
-func SLSRequestScreenCaptureAccess() -> UInt8
 
 /// enables/disables a symbolic hotkeys. These are system shortcuts such as command+tab or Spotlight
 /// it is possible to find all the existing hotkey IDs by using CGSGetSymbolicHotKeyValue on the first few hundred numbers
@@ -209,17 +145,29 @@ private enum MakeKeyWindowEvent {
     /// WindowServer parses is identical to before we widened the buffer.
     static let lengthOffset = 0x04
     static let recordLength: UInt8 = 0xf8
-    /// 0x08: the `CGSEventType`. We post a left-mouse-down then -up; the pair makes the window key. These
-    /// match the public `CGEventType` values.
+    /// 0x08: the `CGSEventType`, matching the public `CGEventType` values. We post the DOWN only. yabai and
+    /// Hammerspoon post a down/up pair, and the pair is what makes it a click: measured on macOS 26.5 (two
+    /// windows, `windowDidBecomeKey` logged), the down alone makes the right window key, an up alone does
+    /// nothing, and the front-process call alone does nothing either. Dropping the up costs no key focus and
+    /// means no control can ever be activated, wherever the point lands — the point can be sanitized, but a
+    /// half-click can't be completed. That is what finally closed #5381 (see `offContentPoint`).
     static let eventTypeOffset = 0x08
     static let leftMouseDown: UInt8 = 0x01 // kCGEventLeftMouseDown
-    static let leftMouseUp: UInt8 = 0x02 // kCGEventLeftMouseUp
-    /// 0x20: `windowLocation`, the window-relative click point (a 16-byte CGPoint). We aim just outside the
-    /// window's top-left corner: the mouse-down still makes it key, but the point hit-tests to no view, so
-    /// nothing is clicked (avoids #5381's top-left hit in fullscreen, and any top-left chrome when windowed).
-    /// Kept small: a wild value risks an app clamping it back to (0,0), i.e. onto real content.
+    /// 0x20: `windowLocation`, the window-relative click point (a 16-byte CGPoint). Aimed far past the
+    /// window's BOTTOM-RIGHT corner, which is the only region no failure has come from:
+    ///   * NaN (yabai's `memset(0xff)`, what we posted before v11.3.1) is sanitized by some apps back to
+    ///     (0, 0), onto real content — Figma's Home button, Telegram's sidebar, Wezterm's first pane (#5381).
+    ///   * a point one or two off the frame sits in the window's resize grab region, and macOS 27 acts on it:
+    ///     rapid switching grew the target's top-left corner out to the screen's visible corner, bottom-right
+    ///     anchored (#5900). The reporter measured -1 broken, -2000 and +3000 clean; never reproducible on
+    ///     macOS 26.5 at any distance.
+    ///   * -2000 still tripped #5381 in fullscreen Figma, so the sanitizing fallback is (0, 0) regardless of
+    ///     how far out the point is. Every #5381 report names a TOP-LEFT control, because that is what (0, 0)
+    ///     hits; aiming positive puts any fallback on the bottom-right of the content instead.
+    /// Hence far past the bottom-right of any conceivable window — too big to be inside one (a fullscreen
+    /// window on a Pro Display XDR is already 3008pt wide), too far out to graze a grab region.
     static let windowLocationOffset = 0x20
-    static let offContentPoint = CGPoint(x: -1, y: -1)
+    static let offContentPoint = CGPoint(x: 300_000, y: 300_000)
     /// 0x3c: the target `CGWindowID`. The event is delivered to this window by id, not by the coordinate.
     static let windowIdOffset = 0x3c
     /// 0x3a: purpose undocumented. yabai and Hammerspoon set it to 0x10.
@@ -227,11 +175,12 @@ private enum MakeKeyWindowEvent {
     static let unknownFlagValue: UInt8 = 0x10
 }
 
-/// Makes the window `wid` the key window of its app by posting a synthetic left-click (down then up) to
-/// the WindowServer. No public API moves key focus across apps. Ported from
+/// Makes the window `wid` the key window of its app by posting a synthetic left-mouse-down to the
+/// WindowServer. No public API moves key focus across apps. Ported from
 /// https://github.com/Hammerspoon/hammerspoon/issues/370#issuecomment-545545468 (yabai's
-/// `window_manager_make_key_window`). The click is aimed just outside the window (see `offContentPoint`)
-/// so it makes the window key without actually clicking any of its content.
+/// `window_manager_make_key_window`), minus the mouse-up it pairs the down with (see `eventTypeOffset`),
+/// and aimed far off the window (see `offContentPoint`) — so the window becomes key without any of its
+/// content being clicked.
 func makeKeyWindow(_ psn: inout ProcessSerialNumber, _ wid: CGWindowID) {
     var wid = wid
     var point = MakeKeyWindowEvent.offContentPoint
@@ -240,12 +189,8 @@ func makeKeyWindow(_ psn: inout ProcessSerialNumber, _ wid: CGWindowID) {
     bytes[MakeKeyWindowEvent.unknownFlagOffset] = MakeKeyWindowEvent.unknownFlagValue
     // deliver the event to this specific window by id (not by the click point below)
     memcpy(&bytes[MakeKeyWindowEvent.windowIdOffset], &wid, MemoryLayout<CGWindowID>.size)
-    // window-relative click point just outside the frame: makes the window key, but hit-tests to no view
     memcpy(&bytes[MakeKeyWindowEvent.windowLocationOffset], &point, MemoryLayout<CGPoint>.size)
-    // post a left-mouse-down then -up; the app reads the pair as "you are now key"
     bytes[MakeKeyWindowEvent.eventTypeOffset] = MakeKeyWindowEvent.leftMouseDown
-    SLPSPostEventRecordTo(&psn, &bytes)
-    bytes[MakeKeyWindowEvent.eventTypeOffset] = MakeKeyWindowEvent.leftMouseUp
     SLPSPostEventRecordTo(&psn, &bytes)
 }
 
@@ -259,12 +204,11 @@ func makeKeyWindow(_ psn: inout ProcessSerialNumber, _ wid: CGWindowID) {
 // pushes events. SkyLight calls the proc on whichever thread snarfs the datagram (the `_NSEventThread`); we
 // keep that callback trivial and hop to main ourselves (see WindowServerEvents.notifyProc).
 //
-// Do NOT call `SLSConnectionDispatchNotificationsToMainQueueIfNotMainThread` on the AppKit-shared main
-// connection: it is NOT needed for delivery (the opt-in alone delivers, confirmed at runtime), and on the
-// shared connection it displaced AppKit's own coordinated-notification routing, so AppKit's
-// `activeSpaceChanged:` / appearance handlers fired off-main on the `_NSEventThread` and crashed. It is kept
-// declared below only to document the trap. All symbols exist since ≥10.10 (CoreGraphics re-exports the
-// CGS-named aliases).
+// Do NOT call `SLSConnectionDispatchNotificationsToMainQueueIfNotMainThread` on this connection: it is not
+// needed for delivery, and it displaces AppKit's own coordinated-notification routing on the connection they
+// share, which fires AppKit's `activeSpaceChanged:` / appearance handlers off-main and crashes. Delivery was
+// confirmed at runtime to need only the per-window opt-in below, never that call. All symbols below exist
+// since ≥10.10 (CoreGraphics re-exports the CGS-named aliases).
 
 /// The per-connection notification callback: (event id, payload, payload length, context, connection id).
 typealias CGSConnectionNotifyProc = @convention(c) (_ event: UInt32, _ data: UnsafeMutableRawPointer?, _ dataLength: Int, _ context: UnsafeMutableRawPointer?, _ cid: CGSConnectionID) -> Void
@@ -273,18 +217,16 @@ typealias CGSConnectionNotifyProc = @convention(c) (_ event: UInt32, _ data: Uns
 @_silgen_name("SLSRegisterConnectionNotifyProc") @discardableResult
 func SLSRegisterConnectionNotifyProc(_ cid: CGSConnectionID, _ proc: CGSConnectionNotifyProc, _ event: UInt32, _ context: UnsafeMutableRawPointer?) -> CGError
 
-/// route this connection's notifications to the main dispatch queue. NOT needed for delivery, and harmful on
-/// the AppKit-shared connection (see the MARK comment above) — declared only to document why we don't call it.
-@_silgen_name("SLSConnectionDispatchNotificationsToMainQueueIfNotMainThread") @discardableResult
-func SLSConnectionDispatchNotificationsToMainQueueIfNotMainThread(_ cid: CGSConnectionID) -> CGError
-
-/// opt this connection into per-window notifications for the given windows (yabai's mechanism). macOS 10.10+
+/// opt this connection into per-window notifications for the given windows (yabai's mechanism). macOS 10.10+.
+/// REPLACES this connection's watch list — it does not add to it. Always pass every wid you still want to
+/// hear from; passing only the new ones silences all the others (measured on macOS 26.5: a live run that sent
+/// deltas saw 0 order-outs, 0 destroys and 0 focus events instead of 91 / 143 / 51, while the
+/// connection-wide creates and moves kept arriving, so nothing looked broken until windows stopped being
+/// removed). There is also no explicit way back: SkyLight exports no `SLSRemoveNotificationsForWindows` /
+/// `SLSStopNotificationsForWindows` (dlsym'd on macOS 26), so dropping a wid from the next call is the only
+/// unsubscribe there is.
 @_silgen_name("SLSRequestNotificationsForWindows") @discardableResult
 func SLSRequestNotificationsForWindows(_ cid: CGSConnectionID, _ windowList: UnsafeMutablePointer<CGWindowID>, _ windowCount: Int32) -> CGError
-
-/// fill `list` with the on-screen (current-Space) window ids, top-most first. `owner` 0 = all. macOS 10.10+
-@_silgen_name("SLSGetOnScreenWindowList") @discardableResult
-func SLSGetOnScreenWindowList(_ cid: CGSConnectionID, _ owner: CGSConnectionID, _ count: Int32, _ list: UnsafeMutablePointer<CGWindowID>, _ outCount: UnsafeMutablePointer<Int32>) -> CGError
 
 // MARK: - WindowServer window query (batched snapshot — see windowserver/WindowServerQuery.swift)
 //
@@ -304,6 +246,12 @@ func SLSWindowIteratorAdvance(_ iterator: CFTypeRef) -> Bool
 @_silgen_name("SLSWindowIteratorGetWindowID")
 func SLSWindowIteratorGetWindowID(_ iterator: CFTypeRef) -> CGWindowID
 
+@_silgen_name("SLSWindowIteratorGetParentID")
+func SLSWindowIteratorGetParentID(_ iterator: CFTypeRef) -> CGWindowID
+
+@_silgen_name("SLSWindowIteratorGetAlpha")
+func SLSWindowIteratorGetAlpha(_ iterator: CFTypeRef) -> Float
+
 @_silgen_name("SLSWindowIteratorGetPID")
 func SLSWindowIteratorGetPID(_ iterator: CFTypeRef) -> pid_t
 
@@ -315,6 +263,12 @@ func SLSWindowIteratorGetLevel(_ iterator: CFTypeRef) -> Int32
 
 @_silgen_name("SLSWindowIteratorGetSpaceTypeMask")
 func SLSWindowIteratorGetSpaceTypeMask(_ iterator: CFTypeRef) -> UInt64
+
+/// A SECOND bitfield alongside `GetAttributes`, and the one that carries minimized / app-hidden /
+/// fullscreen. Decoded by `WsWindowState`; see `WsWindowStateSpecs.md` for the mapped bits and the state
+/// matrix that proves each one specific.
+@_silgen_name("SLSWindowIteratorGetTags")
+func SLSWindowIteratorGetTags(_ iterator: CFTypeRef) -> UInt64
 
 // returns the window frame in top-left-origin global coordinates — same system as kAXPosition/kAXSize and
 // kCGWindowBounds (verified equal to both on macOS 26).

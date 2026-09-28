@@ -79,31 +79,43 @@ class ATShortcut {
     }
 
     func executeAction(_ isARepeat: Bool) {
-        Logger.info { self.id }
+        Logger.debug { self.id }
         ATShortcut.lastEventIsARepeat = isARepeat
         ShortcutActions.execute(id)
     }
 
     /// keyboard events can be unreliable. They can arrive in the wrong order, or may never arrive
     /// this function acts as a safety net to improve the chances that some keyUp behaviors are enforced
-    func redundantSafetyMeasures() {
-        // Keyboard shortcuts come from different sources. As a result, they can arrive in the wrong order (e.g. alt DOWN > alt UP > alt+tab DOWN > alt+tab UP)
-        // The events can be disordered between sources, but not within each source
-        // Another issue is events being dropped by macOS, which we never receive
-        // Knowing this, we handle these edge-cases by double checking if holdShortcut is UP, when any shortcut state is UP
-        // If it is, then we trigger the holdShortcut action
-        if let session = SwitcherSession.current, !session.forceDoNothingOnRelease, Preferences.effectiveShortcutStyle(session.shortcutIndex) == .focusOnRelease {
-            if let currentHoldShortcut = ControlsTab.shortcuts[Preferences.indexToName("holdShortcut", session.shortcutIndex)],
-               id == currentHoldShortcut.id {
-                let currentModifiers = cocoaToCarbonFlags(ModifierFlags.current)
-                if currentModifiers != (currentModifiers | (currentHoldShortcut.shortcut.carbonModifierFlags)) {
-                    currentHoldShortcut.state = .up
-                    ShortcutActions.execute(currentHoldShortcut.id)
-                }
-            }
+    ///
+    /// Keyboard shortcuts come from different sources. As a result, they can arrive in the wrong order (e.g. alt DOWN > alt UP > alt+tab DOWN > alt+tab UP)
+    /// The events can be disordered between sources, but not within each source
+    /// Another issue is events being dropped by macOS, which we never receive
+    /// Knowing this, we handle these edge-cases by double checking if holdShortcut is UP, when any shortcut state is UP
+    /// If it is, then we trigger the holdShortcut action
+    ///
+    /// Call it ONCE, on the session's own holdShortcut, from `settleLostHoldRelease()` — never per shortcut
+    /// inside the matching loop, where the dictionary's iteration order decides the outcome: fired after
+    /// `nextWindowShortcut` has cycled, the release commits one tile PAST what the user asked for.
+    func settleLostRelease(_ recordedHoldRelease: Bool = false) {
+        guard let session = SwitcherSession.current, !session.forceDoNothingOnRelease,
+              Preferences.effectiveShortcutStyle(session.shortcutIndex) == .focusOnRelease,
+              id == Preferences.indexToName("holdShortcut", session.shortcutIndex) else { return }
+        let currentModifiers = cocoaToCarbonFlags(ModifierFlags.current)
+        let isUpNow = currentModifiers != (currentModifiers | shortcut.carbonModifierFlags)
+        // Up now, OR the passive input log paired this Carbon hotkey with a physical release. The second
+        // reading survives either main-runloop drain order and cannot mistake a later held modifier for this
+        // gesture's state.
+        guard isUpNow || recordedHoldRelease else { return }
+        if !isUpNow {
+            Logger.debug { "settling \(self.id) on the physical release paired with this hotkey" }
         }
+        state = .up
+        ShortcutActions.execute(id)
+    }
+
+    /// ensure timers don't keep running if their shortcut is UP
+    func stopRepeatIfUp() {
         if state == .up {
-            // ensure timers don't keep running if their shortcut is UP
             KeyRepeatTimer.stopTimerForRepeatingKey(id)
         }
     }
@@ -122,14 +134,6 @@ enum ShortcutState {
 enum ShortcutScope {
     case global
     case local
-}
-
-extension NSEvent.ModifierFlags {
-    // NSEvent.addLocalMonitorForEvents may return events with broken modifiers (e.g. [.NSEventModifierFlagOption, .NSEventModifierFlagFunction, 0x120])
-    // we filter modifiers to only include valid modifiers; which doesn't include fn as we don't support it as a modifier
-    func cleaned() -> Self {
-        return self.intersection([.command, .shift, .option, .control, .capsLock])
-    }
 }
 
 typealias CarbonModifierFlags = UInt32

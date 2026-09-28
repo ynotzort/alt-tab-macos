@@ -11,6 +11,10 @@ jobs:
     runs-on: macos-15
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - name: Read version from last upstream release commit
+        run: echo "VERSION=$(git log -1 --grep='^chore(release)' --format=%s | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')" >> "$GITHUB_ENV"
       - name: Select Xcode
         run: sudo xcode-select -s /Applications/Xcode_26.0.1.app/Contents/Developer
       - name: Show Xcode version
@@ -24,10 +28,10 @@ jobs:
             -scheme Debug \
             -configuration Debug \
             -derivedDataPath DerivedData \
-            CURRENT_PROJECT_VERSION="11.4.3" \
+            CURRENT_PROJECT_VERSION="$VERSION" \
             SWIFT_ACTIVE_COMPILATION_CONDITIONS="DEBUG LOCAL_PRO_BUILD"
       - name: Verify bundle version
-        run: test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' DerivedData/Build/Products/Debug/AltTab.app/Contents/Info.plist)" = "11.4.3"
+        run: test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleVersion' DerivedData/Build/Products/Debug/AltTab.app/Contents/Info.plist)" = "$VERSION"
       - name: Verify signature
         run: codesign --verify --deep --strict --verbose=2 DerivedData/Build/Products/Debug/AltTab.app
       - name: Package app

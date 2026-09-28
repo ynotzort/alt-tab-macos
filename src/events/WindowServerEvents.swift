@@ -1,38 +1,48 @@
 import Cocoa
 
-/// The WindowServer event tap: AltTab's source of truth for window lifecycle, focus, geometry and Space
-/// membership. Window state comes from SkyLight's notify-proc stream — immune to a busy or AX-lying app
-/// (e.g. Electron throwing away its AX tree) — instead of Accessibility notifications. See
-/// `SkyLight.framework.swift` for the underlying calls and `windowserver/` for the pure decision layer
-/// (routing, decode, acquisition). AX is kept only for on-demand reads (subrole/title/tabs) and the actions.
+/// The WindowServer event tap: AltTab's source of truth for window lifecycle, geometry and Space
+/// membership. Those physical facts come from SkyLight's notify-proc stream — immune to a busy or AX-lying
+/// app (e.g. Electron throwing away its AX tree). See `SkyLight.framework.swift` for the underlying calls and
+/// `windowserver/` for the pure decision layer (routing, decode, acquisition). Per-process AX observers own
+/// semantic focus and title signals; AX reads still supply discovery attributes and actions.
 class WindowServerEvents {
-    /// WS-derived live window set; kept opted-in for per-window delivery (mandatory since Sequoia).
+    /// The wids opted in for per-window delivery (mandatory since Sequoia). Order in/out, focus, and the
+    /// removal side of the model all depend on it: a wid absent here is one we are deaf to.
+    ///
+    /// Two things measured on macOS 26.5 shape everything below. Create/destroy (811/804) and the Space
+    /// notifications are connection-wide, but only once the connection has opted at least one window in:
+    /// with every `SLSRequestNotificationsForWindows` call skipped, not even 811 arrived. And the call
+    /// REPLACES this list rather than adding to it, so the request must always carry the whole set and
+    /// removing a wid from it is a real unsubscribe (see `requestNotifications` and `pruneSubscriptions`).
+    ///
+    /// Grown by `subscribe`, from surfaces the admission resolver considers worth semantic acquisition.
+    /// Level is only a positive hint: substantial floating/presentation surfaces are subscribed too.
     private static var wsWindows = Set<CGWindowID>()
     private static var started = false
+    private static let ingressLock = NSLock()
+    private static var ingress = WsEventIngress()
+    private static var ingressDrainScheduled = false
+
+    /// The cadence the shell re-arms the reducer's re-checks on (hold-release, drag-out). The reducer owns the
+    /// attempt CAPS (`WindowEventReducer.holdReleaseMaxAttempts` / `dragOutMaxAttempts`); the wall-clock
+    /// backstop is `cap × this`, so changing this silently rescales those caps — keep the two in view together.
+    static let recheckInterval: TimeInterval = 0.4
     /// Space switches emit storms of transient animation/snapshot windows; ignore create/destroy briefly
     /// around a Space transition so they aren't mistaken for real windows (RE "transition noise").
     private static var spaceTransitionUntil: TimeInterval = 0
-    private static var inSpaceTransition: Bool { ProcessInfo.processInfo.systemUptime < spaceTransitionUntil }
+    /// Also read by the switcher's show path, which re-reads the topology while this holds — see
+    /// `Windows.updatesBeforeShowing`.
+    static var inSpaceTransition: Bool { ProcessInfo.processInfo.systemUptime < spaceTransitionUntil }
     /// debounces the 1329/1401 Space-change burst into one settled handler (replaces SpacesEvents)
     private static var spaceChangeWorkItem: DispatchWorkItem?
-    /// Per-app activation state (see `ActivationFocusResolver`, the pure kernel deciding which 808s bump the
-    /// MRU around an activation and when the AX backstop yields — first 808 = focus, raise tail swallowed,
-    /// #5596). Keyed by pid so two quick activations don't clobber each other; `until` bounds each entry so a
-    /// straggler can't linger; expired entries are pruned on the next activation and on touch.
-    private static var pendingActivationRaises = [pid_t: ActivationEntry]()
-    /// The window AltTab itself just focused (switcher selection / CLI --focus), consumed by the next
-    /// didActivate of that app: the target is KNOWN, so the activation bumps it directly instead of divining
-    /// it from a racy 808 / AX read (see `ActivationFocusResolver.onActivation`). Time-bounded and one-shot.
-    private static var altTabInitiatedFocus: (wid: CGWindowID, pid: pid_t, at: TimeInterval)?
-
-    static func noteAltTabInitiatedFocus(_ wid: CGWindowID, _ pid: pid_t) {
-        altTabInitiatedFocus = (wid, pid, ProcessInfo.processInfo.systemUptime)
-    }
 
     static func observe() {
         guard !started else { return }
         started = true
-        // Register our notify procs + opt into per-window notifications on the (AppKit-shared) main connection.
+        // Register our notify procs on the (AppKit-shared) main connection. The per-window opt-in is NOT seeded
+        // here: `SLSGetOnScreenWindowList` sees only the current Space's on-screen windows, which is a subset
+        // of what the inventory sweep enumerates a beat later and misses exactly the windows this opt-in is
+        // for (hidden ones that come back). `subscribe` owns the set; see it for why the sweep feeds it.
         // We deliberately DO NOT call `SLSConnectionDispatchNotificationsToMainQueueIfNotMainThread`: on the
         // shared connection it overrode AppKit's own coordinated-notification routing, so AppKit's
         // `activeSpaceChanged:` / appearance handlers started firing inline on the `_NSEventThread` (whichever
@@ -41,66 +51,29 @@ class WindowServerEvents {
         for n in WsEventRouting.Notification.allCases {
             SLSRegisterConnectionNotifyProc(CGS_CONNECTION, notifyProc, n.rawValue, nil)
         }
-        wsWindows = Set(onScreenWindowIds())
-        requestNotifications()
-        Logger.info { "WindowServerEvents: tap installed on cid \(CGS_CONNECTION), opted in to \(wsWindows.count) windows" }
+        Logger.info { "WindowServerEvents: tap installed on cid \(CGS_CONNECTION)" }
         // app activation + hidden state have no WindowServer equivalent (they're AppKit concepts) — NSWorkspace
         let center = NSWorkspace.shared.notificationCenter
         center.addObserver(forName: NSWorkspace.didActivateApplicationNotification, object: nil, queue: .main) { note in
-            if let app = runningApp(note) {
-                let pid = app.processIdentifier
+            if let app = runningApp(note), let pid = Applications.knownPid(app) {
                 Applications.frontmostPid = pid
-                // On activation macOS emits 808s for the app's on-Space windows: the FIRST is the focused
-                // window (bumped by the 808 handler), the rest are raises (see `pendingActivationRaises`).
-                // Re-fronting the raises would reverse the app's MRU order (regression from the AX→WS
-                // migration; the AX path only signalled the one focused window). Snapshot the app's windows so
-                // the 808 handler can swallow the raise tail; `bumpFocusOnActivation` is the AX backstop for
-                // activations that emit no 808 at all. Only windows the storm can actually raise belong in the
-                // set — a window that is NOT raised never consumes its entry, so a genuine focus of it within
-                // the window would be swallowed. Excluded on that basis: minimized windows (not raised;
-                // un-minimizing one right after activation must bump) and INACTIVE TABS (not on-screen, never
-                // raised; clicking one's tab is often the very click that activates the app — the "click the
-                // other Terminal tab" bug). Off-Space windows aren't raised either but are harmless if listed:
-                // focusing one needs a Space switch, which re-activates and rebuilds this set. Time-bounded so
-                // a straggler entry can't outlive the burst and swallow a later genuine focus.
-                let now = ProcessInfo.processInfo.systemUptime
-                pendingActivationRaises = pendingActivationRaises.filter { $0.value.until > now }  // prune expired
-                let wids = Set(Windows.list.compactMap { $0.application.pid == pid && !$0.isMinimized && !$0.isTabbed ? $0.cgWindowId : nil })
-                // 0.5s is deliberately generous (the storm is observed ~10-60ms after activation). The risk is
-                // asymmetric: too SHORT is dangerous — the raise 808s are processed on the main thread behind
-                // AltTab's own activation work (discovery/screenshots/phantom pass), so under load their
-                // processing can lag well past that; if the window expires first, the leftover raises bump and
-                // the MRU inverts again. Too LONG is nearly harmless — a window you can focus by hand is on this
-                // Space and its entry is consumed by its own raise, so its genuine click (a later 808) is no
-                // longer in the set and bumps; only off-Space entries linger, and focusing one requires a Space
-                // switch that re-activates the app and rebuilds this set.
-                // AltTab-initiated focus: the target is known — bump it directly, skip the AX backstop.
-                var knownTarget: CGWindowID? = nil
-                if let intent = altTabInitiatedFocus, intent.pid == pid, now - intent.at < 1 {
-                    knownTarget = intent.wid
-                    altTabInitiatedFocus = nil
+                let frontmostApp = Applications.findOrCreate(pid)
+                TrackedWindowStateBridge.dispatch(.appActivated(pid: pid, now: ProcessInfo.processInfo.systemUptime))
+                if let frontmostApp {
+                    _ = frontmostApp.addWindowlessWindowIfNeeded()
+                    App.checkIfShortcutsShouldBeDisabled(frontmostApp.focusedWindow, frontmostApp)
                 }
-                let activation = ActivationFocusResolver.onActivation(snapshotWids: wids, until: now + 0.5, altTabTarget: knownTarget)
-                pendingActivationRaises[pid] = activation.entry
-                if let bumpWid = activation.bumpWid, let window = Windows.byWindowId[bumpWid] {
-                    window.application.focusedWindow = window
-                    App.checkIfShortcutsShouldBeDisabled(window, nil)
-                    if let changed = Windows.updateLastFocusOrder(window) {
-                        App.refreshOpenUiAfterExternalEvent(changed)
-                    }
-                } else {
-                    bumpFocusOnActivation(pid)
-                }
+                // An app the user just went to is worth one more subscription attempt if its earlier ones
+                // were refused: it is demonstrably alive and it is the app whose semantics matter next.
+                AxObserverRegistry.shared.recover(pid, .processBecameFrontmost)
             }
         }
         center.addObserver(forName: NSWorkspace.didHideApplicationNotification, object: nil, queue: .main) { note in
-            if let app = runningApp(note) { applicationVisibilityChanged(app.processIdentifier, hidden: true) }
+            if let app = runningApp(note), let pid = Applications.knownPid(app) { applicationVisibilityChanged(pid, hidden: true) }
         }
         center.addObserver(forName: NSWorkspace.didUnhideApplicationNotification, object: nil, queue: .main) { note in
-            if let app = runningApp(note) { applicationVisibilityChanged(app.processIdentifier, hidden: false) }
+            if let app = runningApp(note), let pid = Applications.knownPid(app) { applicationVisibilityChanged(pid, hidden: false) }
         }
-        // initial discovery once running apps are listed; subsequent refreshes ride events + switcher shows
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1) { Applications.manuallyRefreshAllWindows() }
     }
 
     /// Non-capturing C callback. The WindowServer calls it on whichever thread snarfs the datagram (often the
@@ -108,240 +81,206 @@ class WindowServerEvents {
     /// AppKit's own coordinated handlers). The payload pointer is only valid for this call, so extract the
     /// integers synchronously, then hop to main ourselves before touching the model.
     private static let notifyProc: CGSConnectionNotifyProc = { event, data, len, _, _ in
+        // Stamp the ARRIVAL, not the processing: the hop to main can queue behind our own work (a show, a
+        // capture), which stretches the apparent gap between two events the WindowServer emitted in the same
+        // instant. Every timing decision downstream — above all how long an activation's raise burst is
+        // considered in flight — is only as good as this stamp.
+        let at = ProcessInfo.processInfo.systemUptime
         var w0: UInt32 = 0, w8: UInt32 = 0
         var s0: UInt64 = 0
         if let d = data, len >= 4 { memcpy(&w0, d, 4) }
         if let d = data, len >= 8 { memcpy(&s0, d, 8) }
         if let d = data, len >= 12 { memcpy(&w8, d.advanced(by: 8), 4) }
-        if Thread.isMainThread {
-            handle(event, w0, s0, w8)
-        } else {
-            DispatchQueue.main.async { handle(event, w0, s0, w8) }
+        guard let notification = WsEventRouting.notification(event) else { return }
+        enqueue(WsEventIngress.Event(notification: notification, w0: w0, space: s0, widInSpace: w8, at: at))
+    }
+
+    /// Serialize every callback through one ordered buffer. A resize drag can emit faster than main can
+    /// snapshot and reduce the model; one queued GCD block per notification then turns a finite drag into a
+    /// long tail of stale work. The pure buffer keeps the latest geometry report per wid and segment while
+    /// semantic edges split segments, so nothing capable of changing focus/lifecycle/order is crossed.
+    private static func enqueue(_ event: WsEventIngress.Event) {
+        ingressLock.lock()
+        ingress.append(event)
+        let shouldSchedule = !ingressDrainScheduled
+        ingressDrainScheduled = true
+        ingressLock.unlock()
+        if shouldSchedule { DispatchQueue.main.async { drainIngress() } }
+    }
+
+    private static func drainIngress() {
+        dispatchPrecondition(condition: .onQueue(.main))
+        ingressLock.lock()
+        let batch = ingress.drain()
+        ingressDrainScheduled = false
+        ingressLock.unlock()
+        if batch.coalescedGeometryEvents > 0 {
+            Logger.debug { "coalesced \(batch.coalescedGeometryEvents) WindowServer geometry events" }
+        }
+        for event in batch.events {
+            handle(event.notification, event.w0, event.space, event.widInSpace, event.at)
         }
     }
 
-    private static func handle(_ event: UInt32, _ w0: UInt32, _ space: UInt64, _ widInSpace: UInt32) {
-        guard let n = WsEventRouting.notification(event) else { return }
+    /// The four window-lifecycle cases each tell `MissionControl` to take a look: the overlay that says a
+    /// gesture is up is created, ordered in, ordered out and destroyed like any other surface, and that is
+    /// the only announcement left on macOS 27 (see `MissionControl`). The look is coalesced there, so every
+    /// other window doing the same thing costs one throttled window-list read.
+    private static func handle(_ n: WsEventRouting.Notification, _ w0: UInt32, _ space: UInt64, _ widInSpace: UInt32,
+                              _ at: TimeInterval) {
         switch n {
         case .activeSpaceChanged, .spaceCurrentChanged:
+            // The same clock that mutes the transition's window storm also names the burst's LEADING edge:
+            // "not already in a transition" is the first 1329/1401 of this switch. That edge gets the cheap
+            // half of the reaction (`WindowEventReducer.spaceTransitionStarted`); `route` below debounces
+            // the expensive half to the trailing edge, as it always has.
+            let isLeadingEdge = !inSpaceTransition
             spaceTransitionUntil = ProcessInfo.processInfo.systemUptime + 0.5
+            if isLeadingEdge { TrackedWindowStateBridge.dispatch(.spaceTransitionStarted) }
         case .windowCreated:
-            if !inSpaceTransition {
-                subscribe(w0)
-                // Remember it's brand-new so its first focus event can promote it even if its app has since
-                // gone background (cmd-N spam → open AltTab: the burst's 808s land while the app is inactive).
-                Windows.recentlyCreatedWindows.insert(w0)
-            }
+            // Creation bookkeeping lives in the reducer (`.windowCreated`). Window numbers are unique for
+            // the login session, so this event must not discard facts already learned for the same surface.
+            // Discovery subscribes after it has read the level.
+            MissionControl.surfacesChanged()
         case .windowDestroyed:
             unsubscribe(w0)
+            WindowSurfaceInventory.remove(w0)
+            MissionControl.surfacesChanged()
+        case .windowOrderedIn:
+            // Our own panel's orderedIn is the true "pixels on screen" moment — it can trail the show's
+            // main-thread work by ~500ms while the WindowServer settles a Space transition. Anchor the
+            // key-repeat grace to it (see `SwitcherSession.panelBecameVisibleAt`).
+            if let session = SwitcherSession.current, session.panelBecameVisibleAt == nil,
+               let panel = TilesPanel.shared, panel.windowNumber > 0, w0 == CGWindowID(panel.windowNumber) {
+                session.panelBecameVisibleAt = ProcessInfo.processInfo.systemUptime
+            }
+            MissionControl.surfacesChanged()
+        case .windowOrderedOut:
+            MissionControl.surfacesChanged()
         default:
             break
         }
-        Logger.debug { "WS \(n) wid=\(w0)" + (WsEventRouting.payloadCarriesSpaceId(n) ? " space=\(space) wid=\(widInSpace)" : "") }
-        route(n, w0, space, widInSpace)
+        // The raw notification is NOT logged here. Every one of them routes to the reducer, which logs the
+        // input plus everything it decided as a single line (`TrackedWindowStateBridge.dispatch`), so a line
+        // here just doubled every event — and that duplication is what made `--logs=debug` the firehose a
+        // second log channel was invented to escape. The one notification that reaches no reducer input is
+        // the Space transition, which is debounced; it logs below.
+        route(n, w0, space, widInSpace, at)
     }
 
-    /// Turn a WindowServer notification into a targeted model mutation. Window events key off `w0` (the wid);
-    /// Space-membership events (1325/1326) key off `widInSpace`/`space` from the payload. Runs on main.
-    private static func route(_ n: WsEventRouting.Notification, _ w0: CGWindowID, _ space: CGSSpaceID, _ widInSpace: CGWindowID) {
+    /// Turn a WindowServer notification into a `ReducerInput` and dispatch it through the reducer — which owns
+    /// every decision this switch used to make inline (`WindowEventReducer.reduce`). Window events key off
+    /// `w0` (the wid); Space-membership events (1325/1326) key off `widInSpace`/`space` from the payload.
+    /// Runs on main.
+    private static func route(_ n: WsEventRouting.Notification, _ w0: CGWindowID, _ space: CGSSpaceID,
+                              _ widInSpace: CGWindowID, _ now: TimeInterval) {
         switch WsEventRouting.action(for: n) {
-        case .bumpFocusOrder:
-            if let window = Windows.byWindowId[w0] {
-                // A brand-new window earns one promotion that ignores the app-active guard: the focus it gets
-                // right after creation. `appendWindow` already fronts new windows on discovery; this also honors
-                // the flag for the rare ordering where the create event lands after the window was appended.
-                // Consume it whatever the outcome, so only that first focus is exempt from the guard.
-                let wasJustCreated = Windows.recentlyCreatedWindows.remove(w0) != nil
-                // Around an app activation, which 808s bump is subtle (first = focus, raise tail swallowed,
-                // #5596) — `ActivationFocusResolver` holds those decisions; this just applies its verdict.
-                let pid = window.application.pid
-                let decision = ActivationFocusResolver.onFocusEvent(pendingActivationRaises[pid], wid: w0,
-                    now: ProcessInfo.processInfo.systemUptime, wasJustCreated: wasJustCreated,
-                    appIsActive: window.application.runningApplication.isActive)
-                pendingActivationRaises[pid] = decision.entry
-                if decision.bump {
-                    window.application.focusedWindow = window
-                    App.checkIfShortcutsShouldBeDisabled(window, nil)
-                    if let changed = Windows.updateLastFocusOrder(window) {
-                        App.refreshOpenUiAfterExternalEvent(changed)
-                    }
-                }
-                // else: tracked, app not frontmost, not brand-new → a transient focus race (e.g. a background
-                // app re-focusing one of its windows). Ignore to avoid MRU churn; a real activation re-bumps
-                // it via bumpFocusOnActivation.
-            } else {
-                // focus hit a window we don't track yet → discover just it, not a full inventory. Record the
-                // focus so it isn't lost: discovery is async, so the window is promoted the moment it's
-                // appended (Windows.appendWindow), else a freshly-focused window (e.g. cmd-N spam) whose 808
-                // outran its discovery would land at the back of the MRU.
-                Windows.windowsPendingFocusPromotion.insert(w0)
-                Applications.discoverWindow(w0)
-            }
+        case .noteFocusEvent:
+            TrackedWindowStateBridge.dispatch(.windowFocused(wid: w0, now: now))
         case .remove:
-            Windows.windowsPendingFocusPromotion.remove(w0)
-            Windows.recentlyCreatedWindows.remove(w0)
-            Windows.windowsPendingSpaceRemoval.remove(w0)
-            if let window = Windows.byWindowId[w0] {
-                Windows.removeWindows([window], true)
-            }
+            TrackedWindowStateBridge.dispatch(.windowDestroyed(wid: w0))
         case .updateGeometry, .refreshVisibility:
-            if let window = Windows.byWindowId[w0] {
-                if n == .windowOrderedOut {
-                    // A tracked window left the screen: closed, or merely minimized / hidden / moved to another
-                    // Space. WS's destroy event (804) lags a real close by seconds — or never fires — for apps
-                    // that retain the CGWindow (Finder), so we can't wait for it; the AX element dies within
-                    // ~20ms. Probe AX: dead ⇒ closed ⇒ remove now; alive ⇒ just off-screen ⇒ keep. Skip during
-                    // a Space transition — then an order-out is just the leaving Space's windows going off
-                    // -screen, not a close, and the post-transition syncSpacesState reconcile covers it.
-                    if !inSpaceTransition {
-                        Applications.removeIfClosedAfterOrderOut(window)
-                        // Minimize has no dedicated WS event — it surfaces as an order-out that isn't a close — so
-                        // re-read kAXMinimized here. Without it the model keeps a stale isMinimized and minDemin
-                        // toggles the wrong way (a just-minimized window's "unminimize" re-minimizes it instead).
-                        // Do NOT reconcile tabs on an order-out: a window going off-screen
-                        // (minimize, fullscreen, Space-move) reports its AXTabGroup inconsistently
-                        // mid-transition, so a transient empty read would wrongly dissolve the tab
-                        // group and strand its inactive tabs as phantoms (the fullscreen-tab
-                        // disappearance). Order-out never changes tab membership anyway.
-                        if let axWindow = window.axUiElement {
-                            Applications.refreshWindowTitleAndTabs(axWindow, w0, window.application, false)
-                        }
-                    }
-                } else {
-                    // moved/resized/ordered-in for a tracked window → refresh just that window's WindowServer
-                    // facts (geometry, fullscreen) from a WS query, NOT an AX read. Coalesced per-wid so a
-                    // resize drag collapses to ≤1 query/200ms.
-                    Applications.windowAttributesThrottler.throttleOrProceed(key: "wid-\(w0)-wsstate") {
-                        Applications.updateWindowStatesViaWindowServer([w0])
-                    }
-                    // De-minimize likewise has no dedicated WS event; it surfaces as an order-in →
-                    // re-read kAXMinimized. Like order-out, do NOT reconcile tabs here: an order-in
-                    // during a fullscreen or Space transition reports the AXTabGroup inconsistently,
-                    // and a transient empty read would dissolve the group and strand its inactive
-                    // tabs as phantoms (the fullscreen-tab disappearance). Tab membership is
-                    // reconciled at the stable points — discovery and each show.
-                    if n == .windowOrderedIn, let axWindow = window.axUiElement {
-                        Applications.refreshWindowTitleAndTabs(axWindow, w0, window.application, false)
-                    }
-                }
-            } else if !inSpaceTransition, n == .windowMoved || n == .windowResized || n == .windowOrderedIn {
-                // Untracked: a window is created at 0x0 and sized a beat later, so the create-time discovery
-                // rejects it on the min-size filter. Its first move/resize/ordered-in is the signal it now has
-                // real geometry → discover it right then, instead of waiting for the next throttled full rescan
-                // (the ~1-2s "new window is slow to appear" regression). Coalesced; discoverWindow is idempotent.
-                Applications.windowAttributesThrottler.throttleOrProceed(key: "wid-\(w0)-discover") {
-                    Applications.discoverWindow(w0)
-                }
+            if n == .windowOrderedOut {
+                TrackedWindowStateBridge.dispatch(.windowOrderedOut(wid: w0, inSpaceTransition: inSpaceTransition))
+            } else if n == .windowOrderedIn {
+                TrackedWindowStateBridge.dispatch(.windowOrderedIn(wid: w0, now: now, inSpaceTransition: inSpaceTransition))
+            } else {
+                TrackedWindowStateBridge.dispatch(.windowMovedOrResized(wid: w0, inSpaceTransition: inSpaceTransition))
             }
         case .updateSpaceMembership:
-            // 1325/1326 carry (spaceId, wid) in the payload, so update just that window's spaceIds — no CGS
-            // re-query / full rescan. Untracked wid → remember a removal so discovery can honor the empty Space
-            // (a rapid-burst background tab whose remove fires before it's tracked, #5830); a later add cancels
-            // it. Then the missed delta no longer strands the tab shown-as-separate until the next show.
-            guard let window = Windows.byWindowId[widInSpace] else {
-                if n == .windowRemovedFromSpace { Windows.windowsPendingSpaceRemoval.insert(widInSpace) }
-                else { Windows.windowsPendingSpaceRemoval.remove(widInSpace) }
-                return
-            }
-            // A tab SWITCH emits no focus event at all — just this Space swap (1325 for the tab coming
-            // on-screen, 1326 for the one leaving). Pre-migration the AX focused-window notification fired for
-            // it; 808 never does. So an inactive tab joining a Space while its app is frontmost IS the focus
-            // signal, and we bump the MRU here or the switcher shows a stale order after clicking another tab.
-            // Read `isTabbed` BEFORE reconcile flips it, and bump OUTSIDE the delta guard: the tab machinery
-            // backfills a background tab's spaceIds from its active sibling, so the 1325 add is usually a
-            // no-op delta (`applySpaceMembershipDelta` returns false).
-            let inactiveTabBecameActive = n == .windowAddedToSpace && window.isTabbed
-                && window.application.runningApplication.isActive
-            if window.applySpaceMembershipDelta(space, added: n == .windowAddedToSpace) {
-                // switching a fullscreen window's tabs swaps which one holds the Space — regroup so the
-                // newly-backgrounded tab stays shown instead of being flagged phantom
-                TabGroup.reconcile()
-                if SwitcherSession.isActive { App.refreshOpenUiAfterExternalEvent([window]) }
-            }
-            if inactiveTabBecameActive {
-                // Joining a Space puts the window ON-SCREEN, so by definition it is no longer an INACTIVE tab —
-                // either it became its group's active tab (tab switch) or it was dragged out to stand alone.
-                // Clear the flag NOW: the AX review can't heal a dragged-out window on its own — its nil-titles
-                // dissolution path skips `isTabbed` windows (an inactive tab legitimately reports nil), and its
-                // former group's active tab still reports a live AXTabGroup when 2+ tabs remain, so the stale
-                // flag kept the dragged-out window hidden forever. Mid-drag, geometry may have just re-linked it
-                // (transiently Space-less) — this clear is the counterpart when it lands back on-screen. The
-                // stale `tabbedSiblingWids` is left for the next AX review to dissolve (its nil-titles path
-                // runs once `isTabbed` is false).
-                window.isTabbed = false
-                window.recomputeIsPhantom()
-                window.application.focusedWindow = window
-                App.checkIfShortcutsShouldBeDisabled(window, nil)
-                if let changed = Windows.updateLastFocusOrder(window) {
-                    App.refreshOpenUiAfterExternalEvent(changed)
-                }
-            }
+            TrackedWindowStateBridge.dispatch(.spaceMembershipChanged(wid: widInSpace, spaceId: space,
+                added: n == .windowAddedToSpace, now: now, inSpaceTransition: inSpaceTransition))
         case .acquireAndDiscriminate:
-            // Discover just this new wid right away (not the throttled full rescan — that was the ~1-2s
-            // "new window is slow to appear" regression). If the window is still 0x0 at create time it'll be
-            // rejected on size and re-discovered from its first move/resize (see .updateGeometry above). A
-            // window created on another Space (discoverWindow's current-Space acquisition can't reach it) is
-            // picked up by the next switcher-show full rescan.
-            if !inSpaceTransition { Applications.discoverWindow(w0) }
+            TrackedWindowStateBridge.dispatch(.windowCreated(wid: w0, now: now, inSpaceTransition: inSpaceTransition))
         case .spaceTransition:
             // 1329/1401 fire during the transition (manuallyRefreshAllWindows above stays muted ~0.5s to
             // ignore the create/destroy storm). Debounce, then refresh topology + reconcile once it settles.
+            // The half of that reaction a summon can't wait 250ms for already ran on the leading edge, in
+            // `handle` above.
+            Logger.debug { "WS \(n) space=\(space)" }
             scheduleSpaceChangeHandling()
         }
     }
 
-    /// AppKit app-activation is the backstop for a window-focus (808) that never arrives (808 and
-    /// NSRunningApplication.isActive are separate clocks; some activations emit no 808 at all). Read the
-    /// now-front app's focused window from AX and bump the MRU, same as a focus event would. Mirrors yabai's
-    /// APPLICATION_FRONT_SWITCHED handler. This is the WEAK signal: the AX read races the app's internal focus
-    /// update and can return the PREVIOUS window (iTerm, #5596), so it YIELDS to the activation's first 808
-    /// (`focusBumped`) — checked at apply time on main, since the read is async and can land after the 808.
-    private static func bumpFocusOnActivation(_ pid: pid_t) {
-        guard let app = Applications.findOrCreate(pid, false), let appAx = app.axUiElement else { return }
-        AXCallScheduler.shared.schedule(key: "pid-\(pid)-activation-focus", pid: pid) {
-            // Our own windows (e.g. Preferences) are tracked like any app's, so self activation gets the same MRU
-            // bump; both AX reads here go through the pid-aware guards so the own-process ones run on main.
-            guard let focused = try? appAx.attributes([kAXFocusedWindowAttribute], pid: pid).focusedWindow,
-                  let wid = try? focused.cgWindowId(pid: pid) else { return }
-            DispatchQueue.main.async {
-                guard Applications.frontmostPid == pid, let window = Windows.byWindowId[wid],
-                      ActivationFocusResolver.axBackstopShouldApply(pendingActivationRaises[pid]) else { return }
-                window.application.focusedWindow = window
-                App.checkIfShortcutsShouldBeDisabled(window, nil)
-                if let changed = Windows.updateLastFocusOrder(window) {
-                    App.refreshOpenUiAfterExternalEvent(changed)
-                }
-            }
+    /// Arm the hold-release re-check (the reducer's `scheduleHoldReleaseCheck` effect): the shell owns the
+    /// timer (`recheckInterval`), the reducer owns the release decision (`.holdReleaseCheck`). Re-checking rather than
+    /// waiting a fixed delay is what makes the hold last exactly as long as a discovery is actually pending
+    /// — a hardcoded delay expired mid-gap on a slow/busy OS and the tile vanished anyway.
+    static func armHoldReleaseCheck(_ wid: CGWindowID, attempt: Int) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + recheckInterval) {
+            TrackedWindowStateBridge.dispatch(.holdReleaseCheck(wid: wid, attempt: attempt))
         }
+    }
+
+    /// Arm the drag-out re-check (the reducer's `scheduleDragOutCheck` effect), mirroring the hold-release
+    /// split: shell timer, reducer verdict (`.dragOutCheck`).
+    static func armDragOutCheck(_ wid: CGWindowID, previousRepWid: CGWindowID, attempt: Int) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + recheckInterval) {
+            TrackedWindowStateBridge.dispatch(.dragOutCheck(wid: wid, previousRepWid: previousRepWid, attempt: attempt))
+        }
+    }
+
+    static func armStandaloneTabCheck(_ wid: CGWindowID, siblingWid: CGWindowID, attempt: Int) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + recheckInterval) {
+            TrackedWindowStateBridge.dispatch(.standaloneTabCheck(wid: wid, siblingWid: siblingWid,
+                                                                  attempt: attempt))
+        }
+    }
+
+    /// A plain activation names only a process. When the model has no focused-window fact for it, perform the
+    /// one read that fills that hole. The answer carries the issue sequence allocated by `AttentionDriver`,
+    /// and therefore loses to any app answer that overtook it.
+    static func readFocusedWindowOnActivation(_ pid: pid_t) {
+        readFocusedWindow(pid, key: "pid-\(pid)-activation-focus", viaActivationRead: true)
+    }
+
+    /// **AltTab's own switch is heard from the OS, never assumed.** Once the focus operation has run, ask the
+    /// app where key focus actually landed. A switch inside the app that is already frontmost produces no
+    /// activation, so for an app whose AX focus notifications never arrive this read is the only thing that
+    /// says the user moved (`testTwoAltTabsIntoTheSameAppBothMoveTheOrder`). A focus that did not take reads
+    /// back the window that kept focus, and the order stays true to the screen (#6055).
+    static func readFocusedWindowAfterFocusing(_ pid: pid_t) {
+        readFocusedWindow(pid, key: "pid-\(pid)-post-focus", viaActivationRead: false)
+    }
+
+    /// A dedicated element carries the measured 250ms cap, so a wedged app can occupy one bounded worker but
+    /// never the main thread or the observer runloop.
+    private static func readFocusedWindow(_ pid: pid_t, key: String, viaActivationRead: Bool) {
+        guard Applications.findOrCreate(pid) != nil else { return }
+        AXCallScheduler.shared.schedule(key: key, pid: pid) {
+            let appAx = AXUIElementCreateApplication(pid)
+            AXUIElementSetMessagingTimeout(appAx, 0.25)
+            // Our own windows (e.g. Preferences) are tracked like any app's; both reads use the pid-aware
+            // wrappers so an own-process query runs AppKit on main.
+            let focused = try? appAx.attributes([kAXFocusedWindowAttribute], pid: pid).focusedWindow
+            let wid = focused.flatMap { try? $0.cgWindowId(pid: pid) }
+            DispatchQueue.main.async { focusedWindowAnswered(pid, wid, viaActivationRead) }
+        }
+    }
+
+    /// The read came back. The post-focus one is the answer the pending switch was waiting for, whether or
+    /// not the app named a window: a wedged app that cannot answer must not keep the rest of the model
+    /// waiting on it either.
+    private static func focusedWindowAnswered(_ pid: pid_t, _ wid: CGWindowID?, _ viaActivationRead: Bool) {
+        if !viaActivationRead { FocusIntents.shared.heardBack(pid: pid) }
+        if let wid {
+            return TrackedWindowStateBridge.dispatch(.axFocusedWindowRead(pid: pid, wid: wid,
+                viaActivationRead: viaActivationRead))
+        }
+        // A wedged or windowless app. The activation read reports it: the model asked for that read and would
+        // otherwise keep waiting on it forever.
+        guard viaActivationRead else { return }
+        TrackedWindowStateBridge.dispatch(.axFocusedWindowReadFailed(pid: pid))
     }
 
     /// 1329/1401 can fire several times during one Space transition; debounce so the topology refresh + UI
-    /// reconcile run once, after it settles.
+    /// reconcile run once, after it settles. The settled reaction (topology refresh + Space re-sync +
+    /// fullscreen re-read + shortcut re-check + UI reconcile) is the reducer's `.spaceChangeSettled` branch.
     private static func scheduleSpaceChangeHandling() {
         spaceChangeWorkItem?.cancel()
-        let work = DispatchWorkItem { handleSpaceChanged() }
+        let work = DispatchWorkItem { TrackedWindowStateBridge.dispatch(.spaceChangeSettled) }
         spaceChangeWorkItem = work
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.25, execute: work)
-    }
-
-    /// The Space-switch reaction that used to live in `SpacesEvents` (NSWorkspace.activeSpaceDidChange):
-    /// refresh the Space topology (cached for the switcher's hot path, #5721), re-read fullscreen for the
-    /// current Space (the Safari full-screen-video window emits no resize/move event), re-check shortcut
-    /// disabling for the focused window, and reconcile any open switcher.
-    private static func handleSpaceChanged() {
-        Spaces.refresh()
-        // re-derive per-window Space membership authoritatively once the transition settles. The 1325/1326
-        // deltas keep it live between transitions, but a Space/display change fires a burst of them (a monitor
-        // plug/unplug creates/destroys whole Spaces), so a full backfill here corrects anything the deltas
-        // missed instead of waiting for the next switcher show. Off-main; reconciles the UI when it lands.
-        Applications.syncSpacesState()
-        Windows.updateIsFullscreenOnCurrentSpace()
-        if let frontmostPid = Applications.frontmostPid,
-           let frontmostApp = Applications.findOrCreate(frontmostPid, false),
-           let focusedWindow = frontmostApp.focusedWindow {
-            App.checkIfShortcutsShouldBeDisabled(focusedWindow, nil)
-        }
-        App.refreshOpenUiAfterExternalEvent(Windows.list)
     }
 
     private static func runningApp(_ note: Notification) -> NSRunningApplication? {
@@ -355,32 +294,66 @@ class WindowServerEvents {
         App.refreshOpenUiAfterExternalEvent(Windows.list.filter { $0.application.pid == pid })
     }
 
-    private static func onScreenWindowIds() -> [CGWindowID] {
-        var buf = [CGWindowID](repeating: 0, count: 4096)
-        var out: Int32 = 0
-        guard SLSGetOnScreenWindowList(CGS_CONNECTION, 0, 4096, &buf, &out) == .success, out > 0 else { return [] }
-        return Array(buf.prefix(Int(out)))
-    }
-
     private static func requestNotifications() {
         var list = Array(wsWindows)
         guard !list.isEmpty else { return }
+        // The WHOLE set goes out every time, not the delta. `SLSRequestNotificationsForWindows` REPLACES this
+        // connection's watch list; it does not add to it. Sending only the new wids left exactly one window
+        // watched and every previously-watched one deaf: measured live, 0 order-outs, 0 destroys and
+        // 0 focus events arrived (vs 91 / 143 / 51 for the same tests with the full array), while the
+        // connection-wide creates/moves kept coming, so the app looked alive and simply never removed a
+        // closed window, never noticed a minimize, and never updated the MRU.
         SLSRequestNotificationsForWindows(CGS_CONNECTION, &list, Int32(list.count))
+        // How many wids we can hear from at all. A window missing from the switcher with no event trail in a
+        // capture is either not enumerated or not opted in; this separates the two.
+        Logger.debug { "opted in to \(list.count) windows" }
     }
 
-    /// Opt the WindowServer into per-window notifications for a wid we now track — from ANY source, including
-    /// the brute-force discovery of other-Space windows. Those never appear in SLSGetOnScreenWindowList, so
-    /// before this they were tracked-but-unsubscribed: we got no destroy/geometry/order events for them (AX's
-    /// per-app observers used to cover them, any Space). Coalesced so a discovery burst re-requests once.
+    /// Opt the WindowServer into per-window notifications for a wid. Called for EVERY app-level wid the
+    /// inventory sweep enumerates, not only the ones we end up tracking: an app that hides its window instead
+    /// of closing it (Electron: QQ, WeChat, Notion, Slack) also tears down its a11y tree, so the sweep can
+    /// acquire no element and rejects the window — and if rejection also meant "unsubscribed", the re-show
+    /// would be silent (it emits no `windowCreated`; the per-window events are the ONLY signal it is back) and
+    /// the window stayed invisible until the next switcher-show sweep, seconds later (#5785). Subscribing is a
+    /// WindowServer fact (CGS lists this wid at an app window level); being tracked is an AX one. Coalesced so
+    /// a sweep sends one request.
+    ///
+    /// "App-level" is a precondition, not a formality: both callers gate on it (the sweep filters its
+    /// enumeration, `Applications.discoverWindow` runs `WindowAdmissionResolver.shouldAcquireSemantics`
+    /// first). Subscribing before that verdict is what put every menu, tooltip and Dock indicator on this
+    /// connection's per-window stream.
     static func subscribe(_ wid: CGWindowID) {
         guard wsWindows.insert(wid).inserted else { return }
         scheduleRequestNotifications()
     }
 
-    /// Drop a wid from the opt-in set when we stop tracking it (destroyed / removed).
+    /// Drop a wid from the opt-in set. Only for a wid the OS confirmed gone: the destroy event (804), or the
+    /// phantom sweep's CGS existence check. Our own model removals never unsubscribe — see `subscribe`.
+    /// Dropping IS the unsubscribe, since the next request carries the set as it stands and the call
+    /// replaces the watch list; SkyLight exports no explicit counterpart (re-checked with `dyld_info
+    /// -exports` on macOS 26.5: no `SLSRemoveNotificationsForWindows` / `SLSStopNotificationsForWindows`).
+    /// No request is sent from here: a dead window has nothing left to tell us, and the next real
+    /// subscribe carries the shortened set anyway.
     static func unsubscribe(_ wid: CGWindowID) {
-        guard wsWindows.remove(wid) != nil else { return }
-        scheduleRequestNotifications()
+        wsWindows.remove(wid)
+    }
+
+    /// Drop from the dedup set every wid the WindowServer no longer lists, called with the inventory sweep's
+    /// all-Space enumeration. `windowDestroyed` is not a reliable eraser (an app that retains its CGWindow
+    /// closes a window without one), so without this the set is the size of the session's HISTORY rather than
+    /// of its current windows.
+    ///
+    /// Dropping a wid here is a real unsubscribe, not just bookkeeping: the next request carries the set as
+    /// it stands, and the call replaces the watch list. So the enumeration alone must NOT decide — a window
+    /// it happens to miss (an inactive tab, an other-Space window CGS omits, #1324) would go silently deaf,
+    /// which is the same failure the delta request caused. Anything still in the model is kept whatever the
+    /// enumeration says; what's left to drop is a wid that is neither listed by the OS nor tracked by us.
+    static func pruneSubscriptions(_ alive: Set<CGWindowID>) {
+        let before = wsWindows.count
+        let tracked = Set(Windows.list.compactMap { $0.cgWindowId })
+        wsWindows.formIntersection(alive.union(tracked))
+        let dropped = before - wsWindows.count
+        if dropped > 0 { Logger.debug { "pruned \(dropped) dead subscriptions (\(wsWindows.count) left)" } }
     }
 
     private static var requestNotificationsPending = false

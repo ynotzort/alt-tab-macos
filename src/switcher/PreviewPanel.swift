@@ -13,19 +13,11 @@ class PreviewPanel: NSPanel {
 
     convenience init() {
         self.init(contentRect: .zero, styleMask: [.nonactivatingPanel, .titled, .fullSizeContentView], backing: .buffered, defer: false)
-        isFloatingPanel = true
-        animationBehavior = .none
-        hidesOnDeactivate = false
-        titleVisibility = .hidden
+        applyFloatingPanelChrome()
         titlebarAppearsTransparent = true
-        backgroundColor = .clear
         contentView = Self.previewView
         Self.borderView.autoresizingMask = [.width, .height]
         Self.previewView.addSubview(Self.borderView)
-        // triggering AltTab before or during Space transition animation brings the window on the Space post-transition
-        collectionBehavior = .canJoinAllSpaces
-        // helps filter out this window from the thumbnails
-        setAccessibilitySubrole(.unknown)
         Self.shared = self
     }
 
@@ -60,6 +52,15 @@ class PreviewPanel: NSPanel {
         }
     }
 
+    /// Order out AND release the displayed frame: the layer would otherwise pin a full-resolution
+    /// frame in this static view for the rest of the app's lifetime, defeating the session-scoped
+    /// Preview-frame cache's release-on-hide (#5861).
+    static func hide() {
+        Self.shared.orderOut(nil)
+        previewView.releaseImage()
+        currentId = nil
+    }
+
     /// Called when a window is removed from `Windows.list`: if our preview was showing that
     /// window, drop the cached IOSurface in `previewView.contents` so it can deallocate.
     /// Without this, closing the previewed window in the background leaves its full-resolution
@@ -77,6 +78,7 @@ class PreviewPanel: NSPanel {
         // Always use the primary screen as reference since all coordinates are relative to it
         frame.origin.y = NSScreen.screens.first!.frame.maxY - frame.maxY
         Self.shared.setFrame(frame, display: false)
+        SearchDiscoveryHint.shared.refreshAfterVisibleWork()
     }
 }
 

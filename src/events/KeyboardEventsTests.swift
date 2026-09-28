@@ -92,6 +92,141 @@ final class KeyboardEventsUtilsTests: XCTestCase {
         XCTAssertEqual(ControlsTab.shortcutsActionsTriggered, ["nextWindowShortcut", "holdShortcut"])
     }
 
+    // alt-down > tab-down > tab-up > (alt-up never lands) > tab-down
+    // The first pair's release is lost, so its session is still open when the second pair's tab-down
+    // arrives. That release must be honoured on the tile the user was looking at, BEFORE the tab-down
+    // cycles: honoured after, the focus commits one tile too far, and the alt-tabs after it ping-pong
+    // against a window that was never picked, seen live.
+    func testLostHoldReleaseIsSettledBeforeTheNextSummonCycles() throws {
+        resetState()
+        ModifierFlags.current = [.option]
+        handleKeyboardEvent(nil, nil, nil, [.option], false)
+        handleKeyboardEvent(KeyboardEventsTestable.globalShortcutsIds["nextWindowShortcut"], .down, nil, nil, false)
+        handleKeyboardEvent(KeyboardEventsTestable.globalShortcutsIds["nextWindowShortcut"], .up, nil, nil, false)
+        XCTAssertEqual(ControlsTab.shortcutsActionsTriggered, ["nextWindowShortcut"])
+        ModifierFlags.current = []
+        handleKeyboardEvent(KeyboardEventsTestable.globalShortcutsIds["nextWindowShortcut"], .down, nil, nil, false)
+        XCTAssertEqual(ControlsTab.shortcutsActionsTriggered,
+                       ["nextWindowShortcut", "holdShortcut", "nextWindowShortcut", "holdShortcut"])
+    }
+
+    func testRecordedReleaseSettlesTheSessionOpenedByItsDelayedHotkey() throws {
+        resetState()
+        ModifierFlags.current = [.option]
+        handleKeyboardEvent(KeyboardEventsTestable.globalShortcutsIds["nextWindowShortcut"], .down,
+                            nil, nil, false, nil, true)
+        XCTAssertEqual(ControlsTab.shortcutsActionsTriggered, ["nextWindowShortcut", "holdShortcut"])
+    }
+
+    func testInputLogSeparatesTwoPairsButKeepsTwoTabsUnderOneHoldTogether() throws {
+        let option = CarbonModifierFlags(1 << 11)
+        let tab = ModifierReleaseLog.Chord(keyCode: 48, modifiers: option)
+        ModifierReleaseLog.setSwitchingChords([tab])
+        ModifierReleaseLog.record([.option])
+        ModifierReleaseLog.recordKeyDown(48, [.option])
+        ModifierReleaseLog.record([])
+        ModifierReleaseLog.record([.option])
+        ModifierReleaseLog.recordKeyDown(48, [.option])
+        ModifierReleaseLog.record([])
+        XCTAssertTrue(ModifierReleaseLog.claimRelease(after: tab, holdModifiers: option))
+        XCTAssertTrue(ModifierReleaseLog.claimRelease(after: tab, holdModifiers: option))
+
+        ModifierReleaseLog.setSwitchingChords([tab])
+        ModifierReleaseLog.record([.option])
+        ModifierReleaseLog.recordKeyDown(48, [.option])
+        ModifierReleaseLog.recordKeyDown(48, [.option])
+        ModifierReleaseLog.record([])
+        XCTAssertFalse(ModifierReleaseLog.claimRelease(after: tab, holdModifiers: option))
+        XCTAssertTrue(ModifierReleaseLog.claimRelease(after: tab, holdModifiers: option))
+    }
+
+    func testInputLogDoesNotClaimAKeyDownFromBeforeRegistrationChanged() throws {
+        let option = CarbonModifierFlags(1 << 11)
+        let tab = ModifierReleaseLog.Chord(keyCode: 48, modifiers: option)
+        ModifierReleaseLog.setSwitchingChords([tab])
+        ModifierReleaseLog.record([.option])
+        ModifierReleaseLog.recordKeyDown(48, [.option])
+        ModifierReleaseLog.record([])
+        ModifierReleaseLog.setSwitchingChords([tab])
+        ModifierReleaseLog.record([.option])
+        ModifierReleaseLog.recordKeyDown(48, [.option])
+        XCTAssertFalse(ModifierReleaseLog.claimRelease(after: tab, holdModifiers: option))
+    }
+
+    func testInputLogDoesNotLetALateKeyDownPoisonTheNextGesture() throws {
+        let option = CarbonModifierFlags(1 << 11)
+        let tab = ModifierReleaseLog.Chord(keyCode: 48, modifiers: option)
+        ModifierReleaseLog.setSwitchingChords([tab])
+        ModifierReleaseLog.record([.option])
+        XCTAssertFalse(ModifierReleaseLog.claimRelease(after: tab, holdModifiers: option))
+        ModifierReleaseLog.recordKeyDown(48, [.option])
+        ModifierReleaseLog.record([])
+        ModifierReleaseLog.record([.option])
+        ModifierReleaseLog.recordKeyDown(48, [.option])
+        ModifierReleaseLog.record([])
+        XCTAssertTrue(ModifierReleaseLog.claimRelease(after: tab, holdModifiers: option))
+    }
+
+    func testInputLogIgnoresAutoRepeatsSoAHeldTabDoesNotShiftLaterPairs() throws {
+        let option = CarbonModifierFlags(1 << 11)
+        let tab = ModifierReleaseLog.Chord(keyCode: 48, modifiers: option)
+        ModifierReleaseLog.setSwitchingChords([tab])
+        // a held ⌥⇥: one press, then the OS's repeats, then the release. Carbon fires once and claims once
+        ModifierReleaseLog.record([.option])
+        ModifierReleaseLog.recordKeyDown(48, [.option])
+        for _ in 0..<5 { ModifierReleaseLog.recordKeyDown(48, [.option], isARepeat: true) }
+        XCTAssertFalse(ModifierReleaseLog.claimRelease(after: tab, holdModifiers: option))
+        ModifierReleaseLog.record([])
+        // two complete pairs delayed behind a stall must each pair with their own release
+        ModifierReleaseLog.record([.option])
+        ModifierReleaseLog.recordKeyDown(48, [.option])
+        ModifierReleaseLog.record([])
+        ModifierReleaseLog.record([.option])
+        ModifierReleaseLog.recordKeyDown(48, [.option])
+        ModifierReleaseLog.record([])
+        XCTAssertTrue(ModifierReleaseLog.claimRelease(after: tab, holdModifiers: option))
+        XCTAssertTrue(ModifierReleaseLog.claimRelease(after: tab, holdModifiers: option))
+    }
+
+    func testInputLogDropsAnUnmatchedClaimAtTheGestureRelease() throws {
+        let option = CarbonModifierFlags(1 << 11)
+        let tab = ModifierReleaseLog.Chord(keyCode: 48, modifiers: option)
+        ModifierReleaseLog.setSwitchingChords([tab])
+        ModifierReleaseLog.record([.option])
+        XCTAssertFalse(ModifierReleaseLog.claimRelease(after: tab, holdModifiers: option))
+        ModifierReleaseLog.record([])
+        ModifierReleaseLog.record([.option])
+        ModifierReleaseLog.recordKeyDown(48, [.option])
+        ModifierReleaseLog.record([])
+        XCTAssertTrue(ModifierReleaseLog.claimRelease(after: tab, holdModifiers: option))
+    }
+
+    func testInputLogRecordsOnlySwitchingChordsSoTypingCannotEvictADelayedHotkey() throws {
+        let option = CarbonModifierFlags(1 << 11)
+        let tab = ModifierReleaseLog.Chord(keyCode: 48, modifiers: option)
+        ModifierReleaseLog.setSwitchingChords([tab])
+        ModifierReleaseLog.record([.option])
+        ModifierReleaseLog.recordKeyDown(48, [.option])
+        ModifierReleaseLog.record([])
+        // a sentence of capitals while main is stalled: well past the log's capacity if it were recorded
+        for _ in 0..<40 {
+            ModifierReleaseLog.record([.shift])
+            ModifierReleaseLog.recordKeyDown(0, [.shift])
+            ModifierReleaseLog.record([])
+        }
+        XCTAssertTrue(ModifierReleaseLog.claimRelease(after: tab, holdModifiers: option))
+    }
+
+    func testInputLogMatchesTheChordWithCapsLockLit() throws {
+        let option = CarbonModifierFlags(1 << 11)
+        let tab = ModifierReleaseLog.Chord(keyCode: 48, modifiers: option)
+        ModifierReleaseLog.setSwitchingChords([tab])
+        ModifierReleaseLog.record([.option, .capsLock])
+        ModifierReleaseLog.recordKeyDown(48, [.option, .capsLock])
+        ModifierReleaseLog.record([.capsLock])
+        XCTAssertTrue(ModifierReleaseLog.claimRelease(after: tab, holdModifiers: option))
+    }
+
     // alt-down > tab-down > tab-up > w-down > w-up > alt-up
     func testCloseWindowShortcut() throws {
         resetState()
@@ -165,6 +300,7 @@ final class KeyboardEventsUtilsTests: XCTestCase {
         Preferences.shortcutStyle = .focusOnRelease
         ControlsTab.shortcuts.values.forEach { $0.state = .up }
         ControlsTab.shortcutsActionsTriggered = []
+        ModifierReleaseLog.reset()
     }
 
     // Issue #5585: Escape (kVK_Escape = 53) reaches the matcher via the cghid event tap in
@@ -185,30 +321,6 @@ final class KeyboardEventsUtilsTests: XCTestCase {
         ModifierFlags.current = []
         handleKeyboardEvent(nil, nil, escapeKeycode, [], false)
         XCTAssertEqual(ControlsTab.shortcutsActionsTriggered, [])
-    }
-
-    // MARK: - Modifier flag filtering (NSEvent.ModifierFlags.cleaned)
-    //
-    // NSEvent.addLocalMonitorForEvents sometimes emits modifier flags with bits we don't care about
-    // (function-key bit; raw bits like 0x120 that AppKit hands back unfiltered). `cleaned()` is the
-    // intersection that strips those down to the supported set before the matcher sees them. Lives
-    // in `ATShortcut.swift` next to the matcher that calls it; tested here because no
-    // ATShortcutTests.swift exists yet and modifier handling is the keyboard-events neighborhood.
-
-    func testCleanedKeepsValidModifierBits() {
-        let valid: NSEvent.ModifierFlags = [.command, .shift, .option, .control, .capsLock]
-        XCTAssertEqual(valid.cleaned(), valid, "every supported bit should survive cleaning")
-    }
-
-    func testCleanedDropsFunctionAndUnknownBits() {
-        let dirty: NSEvent.ModifierFlags = [.option, .function]
-        XCTAssertEqual(dirty.cleaned(), [.option], "the function bit is not a modifier we support")
-        let withGarbage = NSEvent.ModifierFlags(rawValue: NSEvent.ModifierFlags.option.rawValue | 0x120)
-        XCTAssertEqual(withGarbage.cleaned(), [.option], "stray AppKit bits (e.g. 0x120) are dropped")
-    }
-
-    func testCleanedEmptyIsEmpty() {
-        XCTAssertEqual(NSEvent.ModifierFlags([]).cleaned(), [])
     }
 
     private let escapeKeycode: UInt32 = 53 // kVK_Escape

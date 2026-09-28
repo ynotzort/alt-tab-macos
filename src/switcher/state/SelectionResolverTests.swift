@@ -17,9 +17,11 @@ final class SelectionResolverTests: XCTestCase {
 
     /// Concise window builder. Defaults model the common case: visible, non-minimized, non-windowless.
     private func w(_ id: String, focusOrder: Int = 0, visible: Bool = true,
-                   minimized: Bool = false, windowless: Bool = false) -> SelectionWindow {
+                   minimized: Bool = false, windowless: Bool = false,
+                   appearedAfterSummon: Bool = false) -> SelectionWindow {
         SelectionWindow(id: id, visible: visible, lastFocusOrder: focusOrder,
-                        isMinimized: minimized, isWindowlessApp: windowless)
+                        isMinimized: minimized, isWindowlessApp: windowless,
+                        appearedAfterSummon: appearedAfterSummon)
     }
 
     /// Mid-session refresh with most knobs in their default position. The test customizes only
@@ -28,14 +30,26 @@ final class SelectionResolverTests: XCTestCase {
                        selectedIndex: Int = 0,
                        selectedTarget: String? = nil,
                        useLastFocusedRule: Bool = false,
+                       // defaults to true so the existing target-preservation cases read as what they model:
+                       // a target the USER picked. The default-selection cases pass false explicitly.
+                       userPickedSelection: Bool = true,
                        restoreDefaultOnSearchClear: Bool = false,
-                       bestMatchOnSearchChange: Bool = false) -> SelectionInputs {
+                       bestMatchOnSearchChange: Bool = false,
+                       // defaults to "the list is the length it was at the summon", i.e. nothing arrived —
+                       // the cases about a window appearing behind the switcher pass the shorter count.
+                       visibleCountAtSummon: Int? = nil,
+                       // defaults to the ordinary case: the window the user is on is tile 0. The `Non-active
+                       // apps` cases (F) pass false — there the current window is filtered out of the list.
+                       currentWindowIsDrawn: Bool = true) -> SelectionInputs {
         SelectionInputs(list: list,
                         selectedIndex: selectedIndex,
                         selectedTarget: selectedTarget,
                         useLastFocusedRule: useLastFocusedRule,
+                        visibleCountAtSummon: visibleCountAtSummon ?? list.filter { $0.visible }.count,
+                        userPickedSelection: userPickedSelection,
                         restoreDefaultOnSearchClear: restoreDefaultOnSearchClear,
-                        bestMatchOnSearchChange: bestMatchOnSearchChange)
+                        bestMatchOnSearchChange: bestMatchOnSearchChange,
+                        currentWindowIsDrawn: currentWindowIsDrawn)
     }
 
     // MARK: - A. Initial pick (`selectedTarget == nil`)
@@ -89,6 +103,49 @@ final class SelectionResolverTests: XCTestCase {
             w("other", focusOrder: 2),
         ]
         let i = inputs(list: list, useLastFocusedRule: true)
+        XCTAssertEqual(SelectionResolver.decide(i), .resetThenSelect(1))
+    }
+
+    /// A7. The DEFAULT selection keeps tracking the model until the user touches it. Captured live: the
+    /// switcher opens while the window set is still settling (tabs grouping, Spaces settling), so the "second
+    /// visible" of that instant isn't the one that ends up there. The default must be re-derived, NOT locked
+    /// onto whatever occupied the slot mid-churn.
+    func testDefaultSelectionRetracksModelUntilUserPicks() {
+        // Mid-churn the real 2nd window was hidden, so the default landed on "other" at slot 2 and became the
+        // target. Now the model has settled and "prev" is the 2nd visible — the default must move to it.
+        let settled = [w("current"), w("prev"), w("other")]
+        let i = inputs(list: settled, selectedIndex: 2, selectedTarget: "other", userPickedSelection: false)
+        XCTAssertEqual(SelectionResolver.decide(i), .resetThenSelect(1),
+                       "an untouched default must re-derive, not follow the window it happened to land on")
+    }
+
+    /// A8. The same target, but the USER chose it — now it is a commitment and must be followed (#5665).
+    func testUserPickedTargetIsFollowedNotRederived() {
+        let settled = [w("current"), w("prev"), w("other")]
+        let i = inputs(list: settled, selectedIndex: 2, selectedTarget: "other", userPickedSelection: true)
+        XCTAssertEqual(SelectionResolver.decide(i), .selectAt(2))
+    }
+
+    func testVerticalNavigationCommitsTheUserPickBeforeMovingSelection() {
+        let session = SwitcherSession()
+        session.performUserSelection {
+            XCTAssertTrue(session.userPickedSelection)
+            session.selectedIndex = 2
+            session.selectedTarget = "other"
+        }
+        let settled = [w("current"), w("prev"), w("other")]
+        let i = inputs(list: settled, selectedIndex: session.selectedIndex,
+            selectedTarget: session.selectedTarget, userPickedSelection: session.userPickedSelection)
+        XCTAssertEqual(SelectionResolver.decide(i), .selectAt(2))
+    }
+
+    /// A9. The captured failure end-to-end: the default locked onto a window that then slid down the list as
+    /// the model settled, dragging the highlight to a nonsense slot. Re-deriving keeps it on the 2nd visible.
+    func testDefaultDoesNotTrailAWindowThatSlidDownTheList() {
+        // "textedit" was the 2nd visible mid-churn (slot 2, since slot 1 was hidden); once the Finder windows
+        // resolved it sits at slot 5 — following it there is exactly the bug.
+        let settled = [w("finderA"), w("finderB"), w("chrome"), w("slack"), w("claude"), w("textedit")]
+        let i = inputs(list: settled, selectedIndex: 2, selectedTarget: "textedit", userPickedSelection: false)
         XCTAssertEqual(SelectionResolver.decide(i), .resetThenSelect(1))
     }
 
@@ -169,16 +226,36 @@ final class SelectionResolverTests: XCTestCase {
 
     // MARK: - C. Target removed / no longer visible
 
+    func testActionFollowsTargetAfterRemovalBeforeItsIndex() {
+        XCTAssertEqual(SelectionResolver.selectedWindow(in: ["a", "c", "d"], at: 2, target: "c", id: { $0 }), "c")
+    }
+
+    func testActionFollowsTargetAfterItsIndexFallsOutOfBounds() {
+        XCTAssertEqual(SelectionResolver.selectedWindow(in: ["a", "c"], at: 2, target: "c", id: { $0 }), "c")
+    }
+
+    func testActionFollowsTargetAfterInsertionAndReordering() {
+        XCTAssertEqual(SelectionResolver.selectedWindow(in: ["new", "c", "a", "b"], at: 2, target: "c", id: { $0 }), "c")
+    }
+
+    func testActionDoesNotInheritARemovedTargetsIndex() {
+        XCTAssertNil(SelectionResolver.selectedWindow(in: ["a", "b", "d"], at: 2, target: "c", id: { $0 }))
+        XCTAssertNil(SelectionResolver.selectedWindow(in: [String](), at: 0, target: "c", id: { $0 }))
+    }
+
+    func testActionWithoutATargetUsesOnlyAValidIndex() {
+        XCTAssertEqual(SelectionResolver.selectedWindow(in: ["a", "b"], at: 1, target: nil, id: { $0 }), "b")
+        XCTAssertNil(SelectionResolver.selectedWindow(in: ["a"], at: -1, target: nil, id: { $0 }))
+        XCTAssertNil(SelectionResolver.selectedWindow(in: ["a"], at: 1, target: nil, id: { $0 }))
+    }
+
     /// C1. User's picked window closed externally. The id is no longer in the list. Fall through
     /// to `adapt` and end on the previous `selectedIndex` (target backfill).
     func testTargetRemovedAdaptToClosestBelow() {
         // Originally: [a, b, c, d]; user picked "c" at index 2. Then "c" closed:
         let list = [w("a", focusOrder: 0), w("b", focusOrder: 1), w("d", focusOrder: 3)]
         let i = inputs(list: list, selectedIndex: 2, selectedTarget: "c")
-        // visibleIndexes = [0, 1, 2]. selectedIndex (2) is in range and equals lastVisible,
-        // selectedTarget != nil but lookup fails. Tail branch: ensureTargetSet(2) — list[2] is "d"
-        // and the wrapper backfills the target to "d".
-        XCTAssertEqual(SelectionResolver.decide(i), .ensureTargetSet(2))
+        XCTAssertEqual(SelectionResolver.decide(i), .selectAt(2))
     }
 
     /// C1 variant: original `selectedIndex` is now out of bounds for the smaller list.
@@ -210,9 +287,60 @@ final class SelectionResolverTests: XCTestCase {
         // Originally [other, target]; target closed. Now: [other].
         let list = [w("other")]
         let i = inputs(list: list, selectedIndex: 0, selectedTarget: "target")
-        // visibleIndexes=[0]. selectedIndex=0 in range. selectedTarget != nil but lookup fails.
-        // Tail returns ensureTargetSet(0); wrapper backfills target to "other".
-        XCTAssertEqual(SelectionResolver.decide(i), .ensureTargetSet(0))
+        XCTAssertEqual(SelectionResolver.decide(i), .selectAt(0))
+    }
+
+    /// C6. Closing the frontmost window A1 makes its app focus A2. Whether that focus bump lands before or
+    /// after the removal, the selection ends on A2, the window after A1 when the user pressed the key.
+    func testActionHeirIsTheSameWhicheverOrderFocusAndRemovalArrive() {
+        let fallback = SelectionResolver.removalFallback([w("A1"), w("A2"), w("B")], target: "A1", tabSiblings: [])
+        var focusFirst = inputs(list: [w("A2"), w("A1"), w("B")], selectedIndex: 0, selectedTarget: "A1")
+        focusFirst.removalFallback = fallback
+        XCTAssertEqual(SelectionResolver.decide(focusFirst), .selectAt(1))
+        var thenRemoval = inputs(list: [w("A2"), w("B")], selectedIndex: 1, selectedTarget: "A1")
+        thenRemoval.removalFallback = fallback
+        XCTAssertEqual(SelectionResolver.decide(thenRemoval), .selectAt(0))
+        var removalFirst = inputs(list: [w("A2"), w("B")], selectedIndex: 0, selectedTarget: "A1")
+        removalFirst.removalFallback = fallback
+        XCTAssertEqual(SelectionResolver.decide(removalFirst), .selectAt(0))
+    }
+
+    /// C7. Closing a native tab leaves its window open, drawn by a tab that was hidden at the press. That tab
+    /// keeps the selection wherever it sorts, ahead of the window that was next.
+    func testActionHeirPrefersTheTabSiblingThatTookTheTile() {
+        let before = [w("X"), w("T1"), w("Y"), w("T2", visible: false)]
+        var i = inputs(list: [w("X"), w("Y"), w("T2")], selectedIndex: 1, selectedTarget: "T1")
+        i.removalFallback = SelectionResolver.removalFallback(before, target: "T1", tabSiblings: ["T1", "T2"])
+        XCTAssertEqual(SelectionResolver.decide(i), .selectAt(2))
+    }
+
+    /// C7b. With tabs shown as separate windows, a sibling is an ordinary tile: the next window inherits.
+    func testActionHeirIgnoresTabSiblingsThatWereAlreadyDrawn() {
+        let before = [w("X"), w("T1"), w("Y"), w("T2")]
+        var i = inputs(list: [w("X"), w("Y"), w("T2")], selectedIndex: 1, selectedTarget: "T1")
+        i.removalFallback = SelectionResolver.removalFallback(before, target: "T1", tabSiblings: ["T1", "T2"])
+        XCTAssertEqual(SelectionResolver.decide(i), .selectAt(1))
+    }
+
+    /// C8. Quitting an app takes its other windows too; the heir is the first neighbor still drawn.
+    func testActionHeirSkipsNeighborsThatLeftToo() {
+        var i = inputs(list: [w("X"), w("A2", visible: false), w("B")], selectedIndex: 1, selectedTarget: "A1")
+        i.removalFallback = SelectionResolver.removalFallback([w("X"), w("A1"), w("A2"), w("B")], target: "A1", tabSiblings: [])
+        XCTAssertEqual(SelectionResolver.decide(i), .selectAt(2))
+    }
+
+    /// C9. Nothing drawn after the target: the heir is the nearest window before it, wherever it moved to.
+    func testActionHeirFallsBackToTheNearestPrecedingWindow() {
+        var i = inputs(list: [w("Y"), w("X")], selectedIndex: 2, selectedTarget: "A1")
+        i.removalFallback = SelectionResolver.removalFallback([w("X"), w("Y"), w("A1")], target: "A1", tabSiblings: [])
+        XCTAssertEqual(SelectionResolver.decide(i), .selectAt(0))
+    }
+
+    /// C10. A fallback recorded for another window is ignored: the plain rule applies.
+    func testActionHeirIgnoredForAnotherTarget() {
+        var i = inputs(list: [w("A2"), w("X"), w("B")], selectedIndex: 2, selectedTarget: "Y")
+        i.removalFallback = SelectionResolver.removalFallback([w("X"), w("A1"), w("A2"), w("B")], target: "A1", tabSiblings: [])
+        XCTAssertEqual(SelectionResolver.decide(i), .selectAt(2))
     }
 
     // MARK: - D. Search-mode interactions
@@ -234,21 +362,12 @@ final class SelectionResolverTests: XCTestCase {
         XCTAssertEqual(SelectionResolver.decide(i), .resetThenSelect(1))
     }
 
-    /// D3. Target preservation works the same whether or not search is active. (Pre-fix this
-    /// scenario was specifically interesting because `focusedWindowChangedWhileShowing` had a
-    /// search-empty guard; with the fix the guard is irrelevant.)
+    /// D3. Target preservation works the same whether or not search is active — the resolver has no
+    /// search-empty branch, and this pins that it never grows one.
     func testTargetPreservedInSearchMode() {
         let list = [w("p", focusOrder: 0), w("a", focusOrder: 1), w("b", focusOrder: 2)]
         let i = inputs(list: list, selectedIndex: 2, selectedTarget: "b")
         XCTAssertEqual(SelectionResolver.decide(i), .selectAt(2))
-    }
-
-    /// D4. Search filters out the user's pick, but other matches remain — adapt to closest.
-    func testSearchTargetFilteredOutWithOthersMatching() {
-        let list = [w("a"), w("b", visible: false), w("c")]
-        let i = inputs(list: list, selectedIndex: 1, selectedTarget: "b")
-        // visibleIndexes = [0, 2]. selectedIndex=1 not in [0,2] → closest below is 0.
-        XCTAssertEqual(SelectionResolver.decide(i), .selectAt(0))
     }
 
     // MARK: - E. Edge cases
@@ -273,9 +392,108 @@ final class SelectionResolverTests: XCTestCase {
     func testEdgeStaleSelectedTarget() {
         let list = [w("a"), w("b"), w("c")]
         let i = inputs(list: list, selectedIndex: 1, selectedTarget: "missing")
-        // target lookup fails → adapt → selectedIndex=1 in [0,1,2], in range, target was non-nil
-        // so the no-target-set branch doesn't trigger; tail returns ensureTargetSet(1).
-        XCTAssertEqual(SelectionResolver.decide(i), .ensureTargetSet(1))
+        XCTAssertEqual(SelectionResolver.decide(i), .selectAt(1))
+    }
+
+    // MARK: - F. The current window is not in the drawn list (#5941)
+
+    /// F1. `Apps to show: Non-active apps`, the user is on VS Code window V1 and the list draws Chrome's two
+    /// windows. The front tile is ALREADY the window they were on before, so that is where the default
+    /// belongs — stepping over it hands them C2, a window they never asked for.
+    func testInitialPickCurrentWindowFilteredOutLandsOnTheFrontTile() {
+        let list = [w("C1"), w("C2")]
+        let i = inputs(list: list, currentWindowIsDrawn: false)
+        XCTAssertEqual(SelectionResolver.decide(i), .resetThenSelect(0))
+    }
+
+    /// F2. The other half of #5941: having landed on C1, the same shortcut must come BACK to V1. Chrome is
+    /// the active app now, so the list draws VS Code's windows and the front one is V1. Without the fix each
+    /// press walks one window further away and the two-window toggle never returns.
+    func testInitialPickCurrentWindowFilteredOutTogglesBackToWhereItCameFrom() {
+        let list = [w("V1"), w("V2")]
+        let i = inputs(list: list, currentWindowIsDrawn: false)
+        XCTAssertEqual(SelectionResolver.decide(i), .resetThenSelect(0))
+    }
+
+    /// F3. The control for F1, same list shape: while the current window IS drawn (every filter but
+    /// `Non-active apps`), the default still steps over tile 0. This pairing is what pins the fix to the
+    /// flag rather than to the list.
+    func testInitialPickCurrentWindowDrawnStillStepsOverTheFrontTile() {
+        let list = [w("C1"), w("C2")]
+        XCTAssertEqual(SelectionResolver.decide(inputs(list: list)), .resetThenSelect(1))
+    }
+
+    /// F4. One other-app window, current window filtered out — land on it rather than wrapping onto nothing.
+    func testInitialPickCurrentWindowFilteredOutWithASingleTile() {
+        let i = inputs(list: [w("only")], currentWindowIsDrawn: false)
+        XCTAssertEqual(SelectionResolver.decide(i), .resetThenSelect(0))
+    }
+
+    /// F5. Newcomers are still stepped over when the current window is filtered out: a window created and
+    /// focused behind the switcher takes tile 0 and pushes the window the user summoned for to tile 1. The
+    /// two rules compose — one steps over what ARRIVED, the other over the window you are ON.
+    func testInitialPickStepsOverANewcomerEvenWhenTheCurrentWindowIsFilteredOut() {
+        let list = [w("new", appearedAfterSummon: true), w("previous"), w("other")]
+        let i = inputs(list: list, visibleCountAtSummon: 2, currentWindowIsDrawn: false)
+        XCTAssertEqual(SelectionResolver.initialPickIndex(i), 1)
+    }
+
+    /// F6. …and a newcomer that REPLACED a window that left keeps the pick on the front tile, since the list
+    /// never grew. Same replacement rule as with the current window drawn, one tile earlier.
+    func testInitialPickDoesNotStepOverAReplacementWhenTheCurrentWindowIsFilteredOut() {
+        let list = [w("incoming", appearedAfterSummon: true), w("previous"), w("other")]
+        let i = inputs(list: list, visibleCountAtSummon: 3, currentWindowIsDrawn: false)
+        XCTAssertEqual(SelectionResolver.initialPickIndex(i), 0)
+    }
+
+    /// F7. Every drawn window arrived after the summon, so there is no as-of-the-summon list to answer from.
+    /// The fallback must still respect the flag: land on the front tile, never on nothing.
+    func testInitialPickFallsBackToTheFrontTileWhenSteppingOverLeavesNothing() {
+        let list = [w("a", appearedAfterSummon: true), w("b", appearedAfterSummon: true)]
+        let i = inputs(list: list, visibleCountAtSummon: 0, currentWindowIsDrawn: false)
+        XCTAssertEqual(SelectionResolver.initialPickIndex(i), 0)
+    }
+
+    /// F8. Hidden rows sit in the MRU ahead of the first DRAWN tile (a grouped background tab). The pick
+    /// counts drawn tiles, so it lands on the first drawn one, not on raw index 0.
+    func testInitialPickCurrentWindowFilteredOutCountsDrawnTilesNotIndexes() {
+        let list = [w("groupedTab", visible: false), w("C1"), w("C2")]
+        let i = inputs(list: list, currentWindowIsDrawn: false)
+        XCTAssertEqual(SelectionResolver.decide(i), .resetThenSelect(1))
+    }
+
+    /// F9. `Window order: Alphabetical` never counted tiles in the first place — it picks the most recently
+    /// focused drawn window, which is already the right answer when the current window is filtered out. The
+    /// flag must leave that path alone.
+    func testInitialPickLastFocusedRuleIsUnaffectedByTheFlag() {
+        let list = [w("a", focusOrder: 5), w("b", focusOrder: 0), w("c", focusOrder: 3)]
+        let drawn = inputs(list: list, useLastFocusedRule: true)
+        let filtered = inputs(list: list, useLastFocusedRule: true, currentWindowIsDrawn: false)
+        XCTAssertEqual(SelectionResolver.decide(drawn), .resetThenSelect(1))
+        XCTAssertEqual(SelectionResolver.decide(filtered), .resetThenSelect(1))
+    }
+
+    /// F10. Clearing a search query restores the default pick, and the restored default is the #5941 one.
+    func testSearchRestoreDefaultOnClearHonorsTheFilteredOutCurrentWindow() {
+        let list = [w("C1"), w("C2"), w("C3")]
+        let i = inputs(list: list, selectedIndex: 2, selectedTarget: "C3",
+                       restoreDefaultOnSearchClear: true, currentWindowIsDrawn: false)
+        XCTAssertEqual(SelectionResolver.decide(i), .resetThenSelect(0))
+    }
+
+    /// F11. Once the USER has moved the selection it is a commitment, followed by id however the list
+    /// reorders (#5665). The flag only ever answers where the DEFAULT starts.
+    func testUserPickedTargetIsFollowedWhenTheCurrentWindowIsFilteredOut() {
+        let list = [w("C1"), w("C2"), w("C3")]
+        let i = inputs(list: list, selectedIndex: 2, selectedTarget: "C3", currentWindowIsDrawn: false)
+        XCTAssertEqual(SelectionResolver.decide(i), .selectAt(2))
+    }
+
+    /// F12. The both-top-minimized edge lands on tile 0 either way — it never stepped over anything.
+    func testInitialPickTopTwoMinimizedIsUnaffectedByTheFlag() {
+        let list = [w("a", minimized: true), w("b", minimized: true), w("c")]
+        let i = inputs(list: list, currentWindowIsDrawn: false)
+        XCTAssertEqual(SelectionResolver.decide(i), .resetThenSelect(0))
     }
 
     // MARK: - Helper kernel functions
@@ -291,16 +509,78 @@ final class SelectionResolverTests: XCTestCase {
         XCTAssertEqual(SelectionResolver.getLastFocusedOrderWindowIndex(list), 2)
     }
 
-    /// `cycleFromZero` empty / single / multi-visible behavior.
+    /// `secondVisibleIndex` empty / single / multi-visible behavior.
+    /// A window created and focused behind the open switcher takes tile 0 — the list shows the truth — but
+    /// the user pressed the shortcut to get back to the window they were on, and that must not change under
+    /// them. Without this, `[new, current, previous]` re-derived the default to slot 1 and committed to
+    /// `current`, i.e. alt-tab landed on the window you were already on.
+    func testInitialPickStepsOverWindowThatAppearedAfterSummon() {
+        let list = [w("new", appearedAfterSummon: true), w("current"), w("previous")]
+        XCTAssertEqual(SelectionResolver.initialPickIndex(inputs(list: list, visibleCountAtSummon: 2)), 2)
+    }
+
+    /// A newcomer that REPLACED a window instead of joining the list — the live Finder case: switching a tab
+    /// brings in a window the model had never tracked (it takes tile 0 and is focused) while the tab it
+    /// replaced leaves the drawn list. Nothing moved down, so nothing is stepped over: tile 1 is still the
+    /// other Finder window, and stepping over aimed one tile past it at an unrelated app.
+    func testInitialPickDoesNotStepOverANewcomerThatReplacedADrawnWindow() {
+        let list = [w("incomingTab", appearedAfterSummon: true), w("previous"), w("other")]
+        XCTAssertEqual(SelectionResolver.initialPickIndex(inputs(list: list, visibleCountAtSummon: 3)), 1)
+    }
+
+    /// Same shape one beat earlier: the model still had the old tab in front when the shortcut was pressed,
+    /// and both the tab switch AND the focus change land while the switcher is open. The list length is
+    /// unchanged, so the pick lands on the window behind the newly-focused one rather than past it.
+    func testInitialPickDoesNotStepOverANewcomerThatTookFocusFromAWindowThatLeft() {
+        let list = [w("incomingTabOfOtherWindow", appearedAfterSummon: true), w("previous"), w("other")]
+        XCTAssertEqual(SelectionResolver.initialPickIndex(inputs(list: list, visibleCountAtSummon: 3)), 1)
+    }
+
+    /// Two newcomers, one of them a replacement: only the arrival is stepped over, and only from the front.
+    func testInitialPickStepsOverOnlyAsManyNewcomersAsTheListGained() {
+        let list = [w("new", appearedAfterSummon: true), w("incomingTab", appearedAfterSummon: true),
+                    w("previous"), w("other")]
+        XCTAssertEqual(SelectionResolver.initialPickIndex(inputs(list: list, visibleCountAtSummon: 3)), 2)
+    }
+
+    /// A newcomer appended at the BACK (created but never focused) lengthens the list without disturbing the
+    /// front of it, so the pick must not step over the current window to pay for it.
+    func testInitialPickDoesNotStepOverAWindowAppendedBehindTheCurrentOne() {
+        let list = [w("current"), w("previous"), w("new", appearedAfterSummon: true)]
+        XCTAssertEqual(SelectionResolver.initialPickIndex(inputs(list: list, visibleCountAtSummon: 2)), 1)
+    }
+
+    /// The same shape, but the newcomer is not flagged: this is a late read telling us who was ALREADY
+    /// frontmost when the shortcut was pressed. That is news about the past, so the pick re-derives over the
+    /// corrected order rather than stepping over it.
+    func testInitialPickFollowsALateCorrection() {
+        let list = [w("trueFrontmost"), w("current"), w("previous")]
+        XCTAssertEqual(SelectionResolver.initialPickIndex(inputs(list: list)), 1)
+    }
+
+    /// Stepping over must never leave the switcher with nothing selected.
+    func testInitialPickFallsBackWhenSteppingOverLeavesNothing() {
+        let list = [w("a", appearedAfterSummon: true), w("b", appearedAfterSummon: true)]
+        XCTAssertEqual(SelectionResolver.initialPickIndex(inputs(list: list, visibleCountAtSummon: 0)), 1)
+    }
+
     func testCycleFromZeroBehavior() {
-        XCTAssertNil(SelectionResolver.cycleFromZero([]))
-        XCTAssertNil(SelectionResolver.cycleFromZero([w("a", visible: false)]))
+        XCTAssertNil(SelectionResolver.secondVisibleIndex([]))
+        XCTAssertNil(SelectionResolver.secondVisibleIndex([w("a", visible: false)]))
         // Single visible — wraps back to 0.
-        XCTAssertEqual(SelectionResolver.cycleFromZero([w("a")]), 0)
+        XCTAssertEqual(SelectionResolver.secondVisibleIndex([w("a")]), 0)
         // Two visible — advances to 1.
-        XCTAssertEqual(SelectionResolver.cycleFromZero([w("a"), w("b")]), 1)
-        // First invisible — skips to next visible.
-        XCTAssertEqual(SelectionResolver.cycleFromZero([w("a", visible: false), w("b")]), 1)
+        XCTAssertEqual(SelectionResolver.secondVisibleIndex([w("a"), w("b")]), 1)
+        // First invisible and only one window visible — wraps back to that one.
+        XCTAssertEqual(SelectionResolver.secondVisibleIndex([w("a", visible: false), w("b")]), 1)
+        // A HIDDEN window at index 0 must not shift the pick onto the CURRENT window. Captured live: a
+        // background tab is fronted in the MRU the moment it's discovered, then hidden once grouped, so
+        // index 0 is hidden and index 1 is the current window — selection belongs on the one behind it.
+        XCTAssertEqual(SelectionResolver.secondVisibleIndex(
+            [w("hiddenTab", visible: false), w("current"), w("previous")]), 2)
+        // Several hidden tabs ahead of the current window (a tab burst) — still the window behind it.
+        XCTAssertEqual(SelectionResolver.secondVisibleIndex(
+            [w("t1", visible: false), w("t2", visible: false), w("current"), w("previous")]), 3)
     }
 
     /// `findTarget` excludes invisible matches even when the id is present.
@@ -312,4 +592,118 @@ final class SelectionResolverTests: XCTestCase {
         XCTAssertNil(SelectionResolver.findTarget(list, nil))
         XCTAssertNil(SelectionResolver.findTarget(list, "missing"))
     }
+
+    // MARK: - G. Answering `currentWindowIsDrawn` from the frontmost app's windows (#5960)
+
+    /// Concise builder for a window of the frontmost app. Defaults model the common case: a real, drawn,
+    /// on-screen window.
+    private func fw(visible: Bool = true, windowless: Bool = false,
+                    phantom: Bool = false, minimized: Bool = false) -> FrontmostAppWindow {
+        FrontmostAppWindow(visible: visible, isWindowlessApp: windowless,
+                           isPhantom: phantom, isMinimized: minimized)
+    }
+
+    /// G1. #5941, the case the flag exists for: the frontmost app owns a real on-screen window and a filter
+    /// keeps it out of the list, so the front tile is already the window before it.
+    func testCurrentWindowIsDrawnIsFalseWhenARealWindowIsFilteredOut() {
+        XCTAssertFalse(SelectionResolver.currentWindowIsDrawn([fw(visible: false)]))
+    }
+
+    /// G2. The control: the same window drawn.
+    func testCurrentWindowIsDrawnIsTrueWhenTheRealWindowIsDrawn() {
+        XCTAssertTrue(SelectionResolver.currentWindowIsDrawn([fw()]))
+    }
+
+    /// G3. One window drawn and one filtered out — the app still has a tile, so nothing says the window the
+    /// user is looking at is missing.
+    func testCurrentWindowIsDrawnIsTrueWhenOnlySomeWindowsAreFilteredOut() {
+        XCTAssertTrue(SelectionResolver.currentWindowIsDrawn([fw(visible: false), fw()]))
+    }
+
+    /// G4. #5960: the user closed the last window of the frontmost app, which stays running and frontmost
+    /// with nothing but a placeholder, and `Windowless apps: Hide` drops that too. No window of theirs is
+    /// being hidden — the window on top of the screen is the front tile — so the front tile is stepped over.
+    func testCurrentWindowIsDrawnIsTrueForAWindowlessFrontmostApp() {
+        XCTAssertTrue(SelectionResolver.currentWindowIsDrawn([fw(visible: false, windowless: true)]))
+    }
+
+    /// G5. The same app with the placeholder SHOWN: still nothing hidden, still the ordinary rule.
+    func testCurrentWindowIsDrawnIsTrueForADrawnWindowlessPlaceholder() {
+        XCTAssertTrue(SelectionResolver.currentWindowIsDrawn([fw(windowless: true)]))
+    }
+
+    /// G6. An app whose windows are all minimized under `Minimized windows: Hide`. A minimized window is not
+    /// one the user can be looking at, so it never makes the front tile "someone else's window".
+    func testCurrentWindowIsDrawnIsTrueWhenOnlyMinimizedWindowsAreHidden() {
+        XCTAssertTrue(SelectionResolver.currentWindowIsDrawn([fw(visible: false, minimized: true)]))
+    }
+
+    /// G7. A minimized window that IS drawn changes nothing either — the answer must not depend on the
+    /// minimized filter.
+    func testCurrentWindowIsDrawnIsTrueWhenTheOnlyWindowIsADrawnMinimizedOne() {
+        XCTAssertTrue(SelectionResolver.currentWindowIsDrawn([fw(minimized: true)]))
+    }
+
+    /// G8. A window we judged phantom is a window we say does not exist; it cannot be the one being hidden
+    /// from the user.
+    func testCurrentWindowIsDrawnIsTrueWhenTheOnlyWindowIsPhantom() {
+        XCTAssertTrue(SelectionResolver.currentWindowIsDrawn([fw(visible: false, phantom: true)]))
+    }
+
+    /// G9. A placeholder next to a real window that a filter dropped: the real one still answers.
+    func testCurrentWindowIsDrawnIsFalseWhenAPlaceholderAccompaniesAFilteredOutWindow() {
+        XCTAssertFalse(SelectionResolver.currentWindowIsDrawn([fw(windowless: true), fw(visible: false)]))
+    }
+
+    /// G10. The frontmost app has no entry in the list at all (nothing tracked for it yet).
+    func testCurrentWindowIsDrawnIsTrueWhenTheAppHasNoWindows() {
+        XCTAssertTrue(SelectionResolver.currentWindowIsDrawn([]))
+    }
+
+    func testExactAttentionAnswersForTheWindowRatherThanItsApplication() {
+        XCTAssertFalse(SelectionResolver.currentWindowIsDrawn(.exactWindow(isDrawn: false)))
+        XCTAssertTrue(SelectionResolver.currentWindowIsDrawn(.exactWindow(isDrawn: true)))
+    }
+
+    func testUnknownAttentionPreservesTheOrdinaryRule() {
+        XCTAssertTrue(SelectionResolver.currentWindowIsDrawn(.unknown))
+    }
+
+    /// G11. #5960 end to end, through both kernels: the reporter's own steps. Terminal frontmost over
+    /// Chrome/Google and Chrome/YouTube, close Terminal's last window, summon. Terminal contributes only a
+    /// placeholder, so the pick steps over the front tile as usual and lands on Chrome/YouTube. Answering
+    /// the first kernel `false` selected Chrome/Google — the window already on top of the screen — and the
+    /// shortcut looked like it did nothing.
+    func testInitialPickStepsOverTheFrontTileAfterTheFrontmostAppLostItsLastWindow() {
+        let terminal = [FrontmostAppWindow(visible: false, isWindowlessApp: true,
+                                           isPhantom: false, isMinimized: false)]
+        let i = inputs(list: [w("chromeGoogle"), w("chromeYouTube")],
+                       currentWindowIsDrawn: SelectionResolver.currentWindowIsDrawn(terminal))
+        XCTAssertEqual(SelectionResolver.decide(i), .resetThenSelect(1))
+    }
+    // MARK: re-anchoring the hover
+
+    /// A tile inserted before the hovered one moves its index. An index alone would still be in bounds and
+    /// would now point at the neighbour — the highlight would silently be on the wrong window.
+    func testHoverFollowsItsWindowWhenTheListGrowsBeforeIt() {
+        XCTAssertEqual(SelectionResolver.reanchorHover(target: "b", in: ["new", "a", "b", "c"]), 2)
+    }
+
+    func testHoverFollowsItsWindowWhenTheListShrinksBeforeIt() {
+        XCTAssertEqual(SelectionResolver.reanchorHover(target: "c", in: ["b", "c"]), 1)
+    }
+
+    /// Gone means gone. The highlight is not inherited by whoever took the slot.
+    func testHoverIsClearedWhenItsWindowLeaves() {
+        XCTAssertNil(SelectionResolver.reanchorHover(target: "b", in: ["a", "c"]))
+    }
+
+    func testNoHoverStaysNoHover() {
+        XCTAssertNil(SelectionResolver.reanchorHover(target: nil, in: ["a", "b"]))
+    }
+
+    func testHoverIsUnchangedWhenNothingMoved() {
+        XCTAssertEqual(SelectionResolver.reanchorHover(target: "b", in: ["a", "b", "c"]), 1)
+    }
+
 }
